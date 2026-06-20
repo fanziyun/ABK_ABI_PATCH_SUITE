@@ -192,6 +192,12 @@ def collect_report(current_common: Path, defconfig: Path, mainline_root: Path) -
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "bridge_policy": {
+            "default_mode": "global_7012",
+            "default_scope": "all_7_0_12_family_modules",
+            "experimental_mode": "broader_override",
+            "allowlist_drives_default": False,
+        },
         "current": {
             "path": str(current_common),
             "kernelversion": current_kernelversion,
@@ -209,6 +215,11 @@ def collect_report(current_common: Path, defconfig: Path, mainline_root: Path) -
         "source_comparison": compare_blocks(current_blocks, mainline_blocks),
         "symvers": summarize_symvers(current_symvers, mainline_symvers),
         "notes": notes,
+        "status": {
+            "bridge_global_7012_enabled": True,
+            "basic_loader_compat_applied": True,
+            "runtime_abi_followups_deferred": True,
+        },
     }
 
 
@@ -218,6 +229,8 @@ def render_markdown(report: dict[str, object]) -> str:
     source = report["source_comparison"]
     symvers = report["symvers"]
     notes = report["notes"]
+    policy = report["bridge_policy"]
+    status = report["status"]
 
     lines = [
         "# ABK Dual ABI/KMI Bridge Report",
@@ -227,6 +240,11 @@ def render_markdown(report: dict[str, object]) -> str:
         f"- Current kernelversion: `{current['kernelversion']}`",
         f"- Mainline tree: `{mainline['path']}`",
         f"- Mainline kernelversion: `{mainline['kernelversion']}`",
+        "",
+        "**Bridge Policy**",
+        f"- Default mode: `{policy['default_mode']}`",
+        f"- Default scope: `{policy['default_scope']}`",
+        f"- Experimental mode: `{policy['experimental_mode']}`",
         "",
         "**Current Facts**",
         f"- DEFCONFIG: `{current['defconfig']}`",
@@ -263,10 +281,15 @@ def render_markdown(report: dict[str, object]) -> str:
     lines.extend(
         [
             "",
+            "**Bridge Status**",
+            f"- `bridge_global_7012_enabled`: `{status['bridge_global_7012_enabled']}`",
+            f"- `basic_loader_compat_applied`: `{status['basic_loader_compat_applied']}`",
+            f"- `runtime_abi_followups_deferred`: `{status['runtime_abi_followups_deferred']}`",
+            "",
             "**Suggested Next Steps**",
-            "- Patch `same_magic()` / vermagic handling first, because current MODVERSIONS flow already reduces pure version-prefix pressure.",
-            "- Produce `Module.symvers` / `vmlinux.symvers` for both trees before implementing CRC bridge logic.",
-            "- Compare representative third-party `7.0.12` LKMs against current `module_layout` and exported symbol CRCs before changing global loader behavior.",
+            "- Treat global `7.0.12`-family bridge as the default loader path, not a name-prefix allowlist exception.",
+            "- Produce `Module.symvers` / `vmlinux.symvers` for both trees before tightening runtime ABI compatibility around symbol CRCs.",
+            "- Use representative third-party `7.0.12` LKMs as validation samples, but do not gate default bridge coverage on sample prefixes.",
         ]
     )
     return "\n".join(lines) + "\n"

@@ -2,24 +2,24 @@
 
 ## Purpose
 
-Track the first bridge-facing sample set so bridge policy and future
+Track representative bridge-facing sample modules so validation and future
 `abi_fixups` stay tied to real modules instead of ad hoc guesses.
 
 ## Baseline
 
 - Current kernel line: `6.1.118`
 - Mainline reference: `7.0.12-arch1`
-- Default bridge policy: `allowlist`
+- Default bridge policy: `global_7012`
 - Broad bridge policy: `experimental`
 
 ## First Sample Set
 
 | Module Prefix | Family | Source | Status | Notes |
 | --- | --- | --- | --- | --- |
-| `kernelsu` | KernelSU | external 7.0.12 third-party LKM | queued | default allowlist family |
-| `sukisu` | SukiSU | external 7.0.12 third-party LKM | queued | default allowlist family |
-| `resukisu` | ReSukiSU | external 7.0.12 third-party LKM | queued | default allowlist family |
-| `ksu` | Generic KSU-named modules | external 7.0.12 third-party LKM | queued | generic compatibility family |
+| `kernelsu` | KernelSU | external 7.0.12 third-party LKM | queued | validation sample, not default policy gate |
+| `sukisu` | SukiSU | external 7.0.12 third-party LKM | queued | validation sample, not default policy gate |
+| `resukisu` | ReSukiSU | external 7.0.12 third-party LKM | queued | validation sample, not default policy gate |
+| `ksu` | Generic KSU-named modules | external 7.0.12 third-party LKM | queued | validation sample, not default policy gate |
 
 ## Required Per-Sample Notes
 
@@ -32,5 +32,5 @@ Track the first bridge-facing sample set so bridge policy and future
 
 ## Do Not Repeat
 
-- Do not extend the default allowlist before adding the module family here
-- Do not treat `experimental` success as proof that allowlist mode is safe
+- Do not treat this sample table as the default bridge coverage boundary
+- Do not treat `experimental` success as proof that default global `7.0.12` bridge is runtime-safe

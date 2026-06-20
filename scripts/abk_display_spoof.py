@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 DISPLAY_RELEASE = "7.0.12"
+DISPLAY_SECURITY_PATCH = "2026-06"
 
 
 def replace_any(path: Path, candidates: list[str], replacement: str, label: str) -> None:
@@ -27,6 +28,25 @@ def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
     if anchor not in text:
         raise SystemExit(f"{label}: anchor not found in {path}")
     path.write_text(text.replace(anchor, anchor + snippet, 1))
+
+
+def patch_build_utils(path: Path) -> None:
+    text = path.read_text()
+    os_version_block = """  BOOT_IMAGE_HEADER_VERSION=${BOOT_IMAGE_HEADER_VERSION:-3}\n  MKBOOTIMG_ARGS=(\"--header_version\" \"${BOOT_IMAGE_HEADER_VERSION}\")\n"""
+    os_version_new = f"""  BOOT_IMAGE_HEADER_VERSION=${{BOOT_IMAGE_HEADER_VERSION:-3}}\n  BOOT_IMAGE_OS_VERSION=${{ABK_BOOT_IMAGE_OS_VERSION:-16.0.0}}\n  BOOT_IMAGE_OS_PATCH_LEVEL=${{ABK_BOOT_IMAGE_OS_PATCH_LEVEL:-{DISPLAY_SECURITY_PATCH}}}\n  MKBOOTIMG_ARGS=(\"--header_version\" \"${{BOOT_IMAGE_HEADER_VERSION}}\")\n  MKBOOTIMG_ARGS+=(\"--os_version\" \"${{BOOT_IMAGE_OS_VERSION}}\")\n  MKBOOTIMG_ARGS+=(\"--os_patch_level\" \"${{BOOT_IMAGE_OS_PATCH_LEVEL}}\")\n"""
+    if "--os_patch_level" not in text:
+        if os_version_block not in text:
+            raise SystemExit(f"build_utils.sh: expected mkbootimg header block not found in {path}")
+        text = text.replace(os_version_block, os_version_new, 1)
+
+    gki_spl_old = """      local spl_date=$(printf \"%d-%02d-05\\n\" ${spl_year} ${spl_month})\n\n      gki_add_avb_footer \"${boot_image_path}\" \\\n"""
+    gki_spl_new = """      local spl_date=${ABK_GKI_SPL_DATE:-$(printf \"%d-%02d-05\\n\" ${spl_year} ${spl_month})}\n\n      gki_add_avb_footer \"${boot_image_path}\" \\\n"""
+    if "ABK_GKI_SPL_DATE" not in text:
+        if gki_spl_old not in text:
+            raise SystemExit(f"build_utils.sh: expected gki SPL block not found in {path}")
+        text = text.replace(gki_spl_old, gki_spl_new, 1)
+
+    path.write_text(text)
 
 
 def patch_sys_c(path: Path) -> None:
@@ -423,6 +443,10 @@ def main() -> int:
     patch_sys_c(common_dir / "kernel/sys.c")
     patch_utsname_sysctl(common_dir / "kernel/utsname_sysctl.c")
     patch_proc_version(common_dir / "fs/proc/version.c")
+    kernel_root = common_dir.parent
+    build_utils = kernel_root / "build/kernel/build_utils.sh"
+    if build_utils.exists():
+        patch_build_utils(build_utils)
     return 0
 
 
