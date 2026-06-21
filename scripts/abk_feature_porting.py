@@ -2815,7 +2815,7 @@ def patch_io_uring_nowait_core(common_root: Path, reference_root: Path) -> dict[
         if old in wq_scope:
             wq_scope = wq_scope.replace(old, new, 1)
         else:
-            nowait_match = re.search(r"(?m)^(?P<indent>[ \t]*)if \(req->flags & REQ_F_NOWAIT\)\n", wq_scope)
+            nowait_match = re.search(r"(?m)^(?P<indent>[ \t]*)if \(req->flags & REQ_F_NOWAIT\)[^\n]*\n", wq_scope)
             if not nowait_match:
                 raise SystemExit(f"{label}: expected block missing")
             indent = nowait_match.group("indent")
