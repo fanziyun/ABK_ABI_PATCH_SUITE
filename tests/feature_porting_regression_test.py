@@ -340,18 +340,25 @@ static inline void __io_req_set_refcount(struct io_kiocb *req, int nr)
     )
 
 
-def make_fd_alloc_fixture(root: Path, *, with_fdt_words: bool, alloc_signature: str | None = None) -> None:
+def make_fd_alloc_fixture(
+    root: Path,
+    *,
+    with_fdt_words: bool,
+    alloc_signature: str | None = None,
+    alloc_locals: str | None = None,
+    alloc_capacity_block: str | None = None,
+) -> None:
     helper_anchor = "#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds\n\n"
     alloc_signature = alloc_signature or "static struct fdtable * alloc_fdtable(unsigned int nr)"
+    alloc_locals = alloc_locals or "\tstruct fdtable *fdt;\n\tvoid *data;\n\n"
+    alloc_capacity_block = alloc_capacity_block or """\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n"""
 
     write_files(
         root,
         {
             "fs/file.c": f"""{helper_anchor if with_fdt_words else ""}{alloc_signature}
 {{
-\tstruct fdtable *fdt;
-\tvoid *data;
-
+{alloc_locals}\
 \t/*
 \t * Figure out how many fds we actually want to support in this fdtable.
 \t * Allocation steps are keyed to the size of the fdarray, since it
@@ -359,10 +366,7 @@ def make_fd_alloc_fixture(root: Path, *, with_fdt_words: bool, alloc_signature: 
 \t * the fdarray into comfortable page-tuned chunks: starting at 1024B
 \t * and growing in powers of two from there on.
 \t */
-\tnr /= (1024 / sizeof(struct file *));
-\tnr = roundup_pow_of_two(nr + 1);
-\tnr *= (1024 / sizeof(struct file *));
-\tnr = ALIGN(nr, BITS_PER_LONG);
+{alloc_capacity_block}\
 \t/*
 \t * Note that this can drive nr *below* what we had passed if sysctl_nr_open
 \t * had been set lower between the check in expand_files() and here.  Deal
@@ -1019,6 +1023,27 @@ alloc_fdtable(unsigned int nr)""",
         text = (self.root / "fs/file.c").read_text()
         self.assertIn("unsigned int slots_wanted;", text)
         self.assertIn("slots_wanted = abk_fdtable_slots_wanted(nr);", text)
+        self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_fd_alloc_hotpath_accepts_slots_wanted_signature(self) -> None:
+        make_fd_alloc_fixture(
+            self.root,
+            with_fdt_words=False,
+            alloc_signature="static struct fdtable *alloc_fdtable(unsigned int slots_wanted)",
+            alloc_locals="""\tstruct fdtable *fdt;\n\tunsigned int nr;\n\tvoid *data;\n\n""",
+            alloc_capacity_block="""\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n""",
+        )
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("static struct fdtable *alloc_fdtable(unsigned int slots_wanted)", text)
+        self.assertIn("slots_wanted = abk_fdtable_slots_wanted(slots_wanted);", text)
         self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
         self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
 

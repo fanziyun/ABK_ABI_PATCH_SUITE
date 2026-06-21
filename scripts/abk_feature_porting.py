@@ -1028,7 +1028,10 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     file_c = common_root / "fs/file.c"
     text = read_text(file_c)
     marker = "/* ABK feature_porting: fd allocation hotpath helper graft. */"
-    alloc_signature_pattern = r"static\s+struct\s+fdtable\s*\*\s*alloc_fdtable\s*\(\s*unsigned\s+int\s+nr\s*\)"
+    alloc_signature_pattern = (
+        r"static\s+struct\s+fdtable\s*\*\s*alloc_fdtable\s*"
+        r"\(\s*unsigned\s+int\s+(?P<alloc_param>[A-Za-z_]\w*)\s*\)"
+    )
 
     if marker in text:
         return {
@@ -1053,7 +1056,8 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             ],
         }
 
-    if not re.search(alloc_signature_pattern, text, re.MULTILINE):
+    alloc_match = re.search(alloc_signature_pattern, text, re.MULTILINE)
+    if not alloc_match:
         raise SystemExit(
             f"feature_porting/fd_alloc: expected anchor missing in {file_c}: alloc_fdtable(unsigned int nr)"
         )
@@ -1071,7 +1075,6 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             anchor = helper_match.group(0)
             text = replace_once(text, anchor, anchor + "\n" + helper_block, "feature_porting/fd_alloc_helpers")
         else:
-            alloc_match = re.search(alloc_signature_pattern, text, re.MULTILINE)
             if not alloc_match:
                 raise SystemExit("feature_porting/fd_alloc_helpers: alloc_fdtable() anchor missing")
             text = text[:alloc_match.start()] + helper_block + "\n" + text[alloc_match.start():]
@@ -1084,8 +1087,13 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
         alloc_start, alloc_end = find_c_block_regex(text, alloc_signature_pattern, "feature_porting/fd_alloc_alloc_fdtable")
         alloc_scope = text[alloc_start:alloc_end]
         alloc_original_scope = alloc_scope
+        alloc_scope_match = re.search(alloc_signature_pattern, alloc_scope, re.MULTILINE)
+        if not alloc_scope_match:
+            raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: start anchor missing")
+        alloc_param = alloc_scope_match.group("alloc_param")
         capacity_old = """\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n"""
-        capacity_new = """\tslots_wanted = abk_fdtable_slots_wanted(nr);\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n"""
+        capacity_align = "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n"
+        capacity_new = f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" + capacity_align
         sysctl_guard = """\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n"""
         sysctl_guard_new = (
             sysctl_guard
@@ -1093,7 +1101,11 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             + "\t\treturn NULL;\n"
         )
 
-        if "unsigned int slots_wanted;" not in alloc_scope and "unsigned int slots_wanted = " not in alloc_scope:
+        if (
+            alloc_param != "slots_wanted"
+            and "unsigned int slots_wanted;" not in alloc_scope
+            and "unsigned int slots_wanted = " not in alloc_scope
+        ):
             brace_idx = alloc_scope.find("{")
             if brace_idx < 0:
                 raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: opening brace missing")
@@ -1104,7 +1116,11 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
 
         if capacity_old in alloc_scope:
             alloc_scope = alloc_scope.replace(capacity_old, capacity_new, 1)
-        elif "slots_wanted = abk_fdtable_slots_wanted(nr);" not in alloc_scope or "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n" not in alloc_scope:
+        elif f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" in alloc_scope and capacity_align in alloc_scope:
+            pass
+        elif capacity_align in alloc_scope:
+            alloc_scope = alloc_scope.replace(capacity_align, capacity_new, 1)
+        else:
             raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
 
         if "INT_MAX / sizeof(struct file *)" not in alloc_scope:
