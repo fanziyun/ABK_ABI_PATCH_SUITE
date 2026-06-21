@@ -8,18 +8,36 @@ ABK_ABI_PATCH_SUITE_PUBLIC_CHILDREN=(
   feature_porting_backlog
 )
 
+abk_abi_patch_suite_mainline_repo_url() {
+  printf '%s\n' "${ABK_MAINLINE_7012_REPO:-https://github.com/archlinux/linux}"
+}
+
+abk_abi_patch_suite_mainline_ref() {
+  printf '%s\n' "${ABK_MAINLINE_7012_REF:-build-v7.0.12}"
+}
+
 abk_abi_patch_suite_mainline_root() {
   local module_parent
-  local candidate
+  local repo_local_linux
 
   if [ -n "${ABK_MAINLINE_7012_ROOT:-}" ]; then
-    candidate="$ABK_MAINLINE_7012_ROOT"
-  else
-    module_parent="$(cd "$MODULE_DIR/.." && pwd)"
-    candidate="$module_parent/linux"
+    printf '%s\n' "$ABK_MAINLINE_7012_ROOT"
+    return 0
   fi
 
-  printf '%s\n' "$candidate"
+  module_parent="$(cd "$MODULE_DIR/.." && pwd)"
+  repo_local_linux="$module_parent/linux"
+  if [ -d "$repo_local_linux" ]; then
+    printf '%s\n' "$repo_local_linux"
+    return 0
+  fi
+
+  if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+    printf '%s/reference/linux\n' "$GITHUB_WORKSPACE"
+    return 0
+  fi
+
+  printf '%s\n' "$repo_local_linux"
 }
 
 abk_abi_patch_suite_common_dir() {
@@ -52,13 +70,27 @@ abk_abi_patch_suite_apply_display_release_spoof() {
   abk_abi_patch_suite_patch_boot_image_logging_if_present
 }
 
-abk_abi_patch_suite_require_mainline_7012() {
+abk_abi_patch_suite_prepare_mainline_7012_root() {
   local mainline_root
+  local mainline_repo
+  local mainline_ref
   local kernelversion
 
   mainline_root="$(abk_abi_patch_suite_mainline_root)"
+  mainline_repo="$(abk_abi_patch_suite_mainline_repo_url)"
+  mainline_ref="$(abk_abi_patch_suite_mainline_ref)"
 
-  [ -d "$mainline_root" ] || abk_die "7.0.12 reference tree not found: $mainline_root. Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree or place one at ./linux relative to the repo root."
+  if [ ! -d "$mainline_root" ]; then
+    if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+      mkdir -p "$(dirname "$mainline_root")"
+      abk_log "prepare 7.0.12 reference tree for ABK CI: $mainline_repo @ $mainline_ref -> $mainline_root"
+      git clone --depth 1 --branch "$mainline_ref" "$mainline_repo" "$mainline_root" \
+        || abk_die "failed to clone 7.0.12 reference tree from $mainline_repo @ $mainline_ref into $mainline_root"
+    else
+      abk_die "7.0.12 reference tree not found: $mainline_root. Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree or place one at ./linux relative to the repo root."
+    fi
+  fi
+
   abk_require_file "$mainline_root/Makefile"
   kernelversion="$(make -s -C "$mainline_root" kernelversion 2>/dev/null || true)"
   [ -n "$kernelversion" ] || abk_die "unable to resolve kernelversion for mainline tree: $mainline_root"
@@ -70,6 +102,13 @@ abk_abi_patch_suite_require_mainline_7012() {
       abk_die "expected 7.0.12-family tree, found $kernelversion at $mainline_root"
       ;;
   esac
+
+  export ABK_MAINLINE_7012_ROOT="$mainline_root"
+  printf '%s\n' "$mainline_root"
+}
+
+abk_abi_patch_suite_require_mainline_7012() {
+  abk_abi_patch_suite_prepare_mainline_7012_root >/dev/null
 }
 
 abk_abi_patch_suite_bridge_report_dir() {
@@ -102,7 +141,7 @@ abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
 
   abk_log "apply child: abi_bridge (bridge preflight + loader bridge)"
   common_dir="$(abk_abi_patch_suite_common_dir)"
-  mainline_root="$(abk_abi_patch_suite_mainline_root)"
+  mainline_root="$(abk_abi_patch_suite_prepare_mainline_7012_root)"
   report_dir="$(abk_abi_patch_suite_bridge_report_dir)"
 
   abk_require_file "$common_dir/kernel/module/version.c"
@@ -110,8 +149,6 @@ abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
   abk_require_file "$common_dir/include/linux/vermagic.h"
   abk_require_file "$common_dir/include/linux/module.h"
   abk_require_file "$DEFCONFIG"
-  abk_abi_patch_suite_require_mainline_7012
-
   mkdir -p "$report_dir"
   python3 "$MODULE_DIR/scripts/abk_dual_abi_bridge_report.py" \
     "$common_dir" \

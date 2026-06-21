@@ -112,10 +112,16 @@ Legacy child id now rejected:
 
 1. `ABK_MAINLINE_7012_ROOT`
 2. repo-local `./linux`
+3. when running inside `abk` GitHub Actions, auto-cloned `$GITHUB_WORKSPACE/reference/linux`
 
 No script should fall back to a developer-machine absolute path.
 
-If the reference tree is missing, the module now fails with an explicit message telling the caller to set `ABK_MAINLINE_7012_ROOT`.
+When running inside `abk` CI and no reference tree is present yet, the module will shallow-clone it automatically.
+
+Optional clone-control env:
+
+- `ABK_MAINLINE_7012_REPO`
+- `ABK_MAINLINE_7012_REF`
 
 ## Usage
 
@@ -154,18 +160,24 @@ Bridge test module:
 bash ABK_ABI_PATCH_SUITE/tests/build_bridge_test_ko.sh "$ABK_MAINLINE_7012_ROOT"
 ```
 
-## CI
+## ABK CI
 
-Remote CI should prepare the 7.0.12 reference tree outside the module scripts and inject it through:
+This module set is intended to be injected by `abk` kernel build workflows through:
 
-```bash
-ABK_MAINLINE_7012_ROOT="$GITHUB_WORKSPACE/reference/linux"
+```text
+set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#<child>;after_patch
 ```
 
-The workflow in `.github/workflows/abk-abi-patch-suite.yml` uses shallow clones for both:
+Inside `abk` CI, `setup.sh` now adapts to that environment directly:
 
-- target Android 14 / 6.1 tree
-- reference 7.0.12 tree
+- reads `GITHUB_WORKSPACE`, `KERNEL_ROOT`, `DEFCONFIG`, and `CUSTOM_EXTERNAL_MODULE_STAGE`
+- auto-prepares the 7.0.12 reference tree under `$GITHUB_WORKSPACE/reference/linux` when needed
+- exports `ABK_MAINLINE_7012_ROOT` for the Python child scripts
+
+Default auto-clone source:
+
+- repo: `https://github.com/archlinux/linux`
+- ref: `build-v7.0.12`
 
 ## Docs
 
