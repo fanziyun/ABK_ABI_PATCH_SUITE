@@ -821,17 +821,16 @@ def patch_pidfd_preparation_compat(common_root: Path) -> dict[str, object]:
     fork_marker = "\t/* ABK feature_porting: keep CLONE_PIDFD on legacy pidfd plumbing; pidfs remains deferred. */\n"
     legacy_entry_marker = "/* ABK feature_porting: phase-two scan-based EEVDF runtime-state and PID migration entry executed. */"
     entry_marker = "/* ABK feature_porting: phase-three scan-based EEVDF runtime-state and pidfd compat entry executed. */"
+    fork_anchor = """\t/*\n\t * This has to happen after we've potentially unshared the file\n\t * descriptor table (so that the pidfd doesn't leak into the child\n\t * if the fd table isn't shared).\n\t */\n\tif (clone_flags & CLONE_PIDFD) {\n"""
+    fork_new = """\t/*\n\t * This has to happen after we've potentially unshared the file\n\t * descriptor table (so that the pidfd doesn't leak into the child\n\t * if the fd table isn't shared).\n\t */\n\t/* ABK feature_porting: keep CLONE_PIDFD on legacy pidfd plumbing; pidfs remains deferred. */\n\tif (clone_flags & CLONE_PIDFD) {\n"""
 
     ensure_contains(pid_c, "int pidfd_create(struct pid *pid, unsigned int flags)\n{", "feature_porting/pidfd_pid")
     ensure_contains(pid_c, "SYSCALL_DEFINE2(pidfd_open, pid_t, pid, unsigned int, flags)\n{", "feature_porting/pidfd_pid")
     ensure_contains(pid_c, "static int pidfd_getfd(struct pid *pid, int fd)\n{", "feature_porting/pidfd_pid")
     ensure_contains(pid_c, "SYSCALL_DEFINE3(pidfd_getfd, int, pidfd, int, fd,", "feature_porting/pidfd_pid")
     ensure_contains(fork_c, "const struct file_operations pidfd_fops = {\n", "feature_porting/pidfd_fork")
-    ensure_contains(
-        fork_c,
-        "\tif (clone_flags & CLONE_PIDFD) {\n\t\tretval = get_unused_fd_flags(O_RDWR | O_CLOEXEC);\n",
-        "feature_porting/pidfd_fork",
-    )
+    if fork_anchor not in fork_text and fork_new not in fork_text:
+        raise SystemExit(f"feature_porting/pidfd_fork: expected anchor missing in {fork_c}: {fork_anchor}")
 
     helper_anchor = "int pidfd_create(struct pid *pid, unsigned int flags)\n{"
     helper_block = """/* ABK feature_porting: pidfd compat helper graft. */\nstatic inline bool abk_pidfd_has_forbidden_flags(unsigned int flags,\n\t\t\t\t\t unsigned int allowed)\n{\n\treturn flags & ~allowed;\n}\n\nint pidfd_create(struct pid *pid, unsigned int flags)\n{"""
@@ -853,8 +852,6 @@ def patch_pidfd_preparation_compat(common_root: Path) -> dict[str, object]:
     if getfd_flags_old in pid_text:
         pid_text = replace_once(pid_text, getfd_flags_old, getfd_flags_new, "feature_porting/pidfd_getfd_flags")
 
-    fork_anchor = """\t/*\n\t * This has to happen after we've potentially unshared the file\n\t * descriptor table (so that the pidfd doesn't leak into the child\n\t * if the fd table isn't shared).\n\t */\n\tif (clone_flags & CLONE_PIDFD) {\n"""
-    fork_new = """\t/*\n\t * This has to happen after we've potentially unshared the file\n\t * descriptor table (so that the pidfd doesn't leak into the child\n\t * if the fd table isn't shared).\n\t */\n\t/* ABK feature_porting: keep CLONE_PIDFD on legacy pidfd plumbing; pidfs remains deferred. */\n\tif (clone_flags & CLONE_PIDFD) {\n"""
     if fork_marker not in fork_text:
         fork_text = replace_once(fork_text, fork_anchor, fork_new, "feature_porting/pidfd_fork_marker")
 
@@ -1101,13 +1098,27 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
 
     blk_mq_anchor_new = """static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tvoid (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;\n\tstruct request_queue *q = data->q;\n"""
     blk_mq_anchor_old = """static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tstruct request_queue *q = data->q;\n"""
-    blk_mq_with_marker_new = marker + """\nstatic void blk_mq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)\n{\n\tstruct elevator_queue *e = data->q->elevator;\n\n\tif (!e || !e->type->ops.limit_depth)\n\t\treturn;\n\tif (op_is_flush(opf) || blk_op_is_passthrough(opf) ||\n\t    (data->flags & BLK_MQ_REQ_RESERVED))\n\t\treturn;\n\n\te->type->ops.limit_depth(opf, data);\n}\n\nstatic struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tstruct request_queue *q = data->q;\n"""
+    blk_mq_limit_call = """\tif (limit_depth)\n\t\tlimit_depth(data->cmd_flags, data);\n"""
+    blk_mq_with_marker_new = marker + """\nstatic void blk_mq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)\n{\n\tstruct elevator_queue *e = data->q->elevator;\n\n\tif (!e || !e->type->ops.limit_depth)\n\t\treturn;\n\tif (op_is_flush(opf) || blk_op_is_passthrough(opf) ||\n\t    (data->flags & BLK_MQ_REQ_RESERVED))\n\t\treturn;\n\n\te->type->ops.limit_depth(opf, data);\n}\n\nstatic struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tvoid (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;\n\tstruct request_queue *q = data->q;\n"""
     blk_mq_with_marker_old = marker + """\nstatic void blk_mq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)\n{\n\tstruct elevator_queue *e = data->q->elevator;\n\n\tif (!e || !e->type->ops.limit_depth)\n\t\treturn;\n\tif (op_is_flush(opf) || blk_op_is_passthrough(opf) ||\n\t    (data->flags & BLK_MQ_REQ_RESERVED))\n\t\treturn;\n\n\te->type->ops.limit_depth(opf, data);\n}\n\nstatic struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tvoid (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;\n\tstruct request_queue *q = data->q;\n"""
     if marker not in blk_mq_text:
         if blk_mq_anchor_new in blk_mq_text:
             blk_mq_text = replace_once(blk_mq_text, blk_mq_anchor_new, blk_mq_with_marker_new, "feature_porting/blk_async_depth_blk_mq_add_helper")
         else:
             blk_mq_text = replace_once(blk_mq_text, blk_mq_anchor_old, blk_mq_with_marker_old, "feature_porting/blk_async_depth_blk_mq_add_helper")
+
+    needs_limit_depth_decl = (
+        marker in blk_mq_text
+        or "limit_depth = blk_mq_limit_depth;" in blk_mq_text
+        or blk_mq_limit_call in blk_mq_text
+    )
+    if needs_limit_depth_decl and blk_mq_anchor_new not in blk_mq_text and blk_mq_anchor_old in blk_mq_text:
+        blk_mq_text = replace_once(
+            blk_mq_text,
+            blk_mq_anchor_old,
+            blk_mq_anchor_new,
+            "feature_porting/blk_async_depth_blk_mq_restore_decl",
+        )
 
     blk_mq_limit_old = """\tif (q->elevator) {\n\t\tstruct elevator_queue *e = q->elevator;\n\n\t\tdata->rq_flags |= RQF_ELV;\n\n\t\t/*\n\t\t * Flush/passthrough requests are special and go directly to the\n\t\t * dispatch list. Don't include reserved tags in the\n\t\t * limiting, as it isn't useful.\n\t\t */\n\t\tif (!op_is_flush(data->cmd_flags) &&\n\t\t    !blk_op_is_passthrough(data->cmd_flags) &&\n\t\t    e->type->ops.limit_depth &&\n\t\t    !(data->flags & BLK_MQ_REQ_RESERVED))\n\t\t\tlimit_depth = e->type->ops.limit_depth;\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!(data->rq_flags & RQF_ELV))\n\t\tblk_mq_tag_busy(data->hctx);\n\n\tif (data->flags & BLK_MQ_REQ_RESERVED)\n\t\tdata->rq_flags |= RQF_RESV;\n"""
     blk_mq_limit_old_legacy = """\tif (q->elevator) {\n\t\tstruct elevator_queue *e = q->elevator;\n\n\t\tdata->rq_flags |= RQF_ELV;\n\n\t\t/*\n\t\t * Flush/passthrough requests are special and go directly to the\n\t\t * dispatch list. Don't include reserved tags in the\n\t\t * limiting, as it isn't useful.\n\t\t */\n\t\tif (!op_is_flush(data->cmd_flags) &&\n\t\t    !blk_op_is_passthrough(data->cmd_flags) &&\n\t\t    e->type->ops.limit_depth &&\n\t\t    !(data->flags & BLK_MQ_REQ_RESERVED))\n\t\t\te->type->ops.limit_depth(data->cmd_flags, data);\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!(data->rq_flags & RQF_ELV))\n\t\tblk_mq_tag_busy(data->hctx);\n\n\tif (data->flags & BLK_MQ_REQ_RESERVED)\n\t\tdata->rq_flags |= RQF_RESV;\n"""
