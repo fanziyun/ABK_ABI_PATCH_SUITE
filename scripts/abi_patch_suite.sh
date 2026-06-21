@@ -13,7 +13,27 @@ abk_abi_patch_suite_mainline_repo_url() {
 }
 
 abk_abi_patch_suite_mainline_ref() {
-  printf '%s\n' "${ABK_MAINLINE_7012_REF:-build-v7.0.12}"
+  printf '%s\n' "${ABK_MAINLINE_7012_REF:-v7.0.12-arch1}"
+}
+
+abk_abi_patch_suite_clone_mainline_7012() {
+  local mainline_repo="$1"
+  local mainline_ref="$2"
+  local mainline_root="$3"
+
+  if git clone --depth 1 --branch "$mainline_ref" "$mainline_repo" "$mainline_root"; then
+    return 0
+  fi
+
+  rm -rf "$mainline_root"
+  mkdir -p "$mainline_root"
+  (
+    cd "$mainline_root" || exit 1
+    git init -q
+    git remote add origin "$mainline_repo"
+    git fetch --depth 1 origin "$mainline_ref"
+    git checkout -q FETCH_HEAD
+  ) || return 1
 }
 
 abk_abi_patch_suite_mainline_root() {
@@ -84,7 +104,7 @@ abk_abi_patch_suite_prepare_mainline_7012_root() {
     if [ -n "${GITHUB_WORKSPACE:-}" ]; then
       mkdir -p "$(dirname "$mainline_root")"
       abk_log "prepare 7.0.12 reference tree for ABK CI: $mainline_repo @ $mainline_ref -> $mainline_root"
-      git clone --depth 1 --branch "$mainline_ref" "$mainline_repo" "$mainline_root" \
+      abk_abi_patch_suite_clone_mainline_7012 "$mainline_repo" "$mainline_ref" "$mainline_root" \
         || abk_die "failed to clone 7.0.12 reference tree from $mainline_repo @ $mainline_ref into $mainline_root"
     else
       abk_die "7.0.12 reference tree not found: $mainline_root. Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree or place one at ./linux relative to the repo root."

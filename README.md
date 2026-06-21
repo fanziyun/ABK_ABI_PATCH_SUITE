@@ -177,7 +177,7 @@ Inside `abk` CI, `setup.sh` now adapts to that environment directly:
 Default auto-clone source:
 
 - repo: `https://github.com/archlinux/linux`
-- ref: `build-v7.0.12`
+- ref: `v7.0.12-arch1`
 
 ## Docs
 
