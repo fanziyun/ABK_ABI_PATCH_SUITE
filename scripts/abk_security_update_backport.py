@@ -384,7 +384,7 @@ def apply_candidate(common_root: Path, candidate: Candidate) -> dict[str, object
 
 def render_markdown(report: dict[str, object]) -> str:
     lines = [
-        "# ABK Security Update Backport Report",
+        "# ABK Security Backport Report",
         "",
         f"- Generated: `{report['generated_at_utc']}`",
         f"- Current tree: `{report['current_common_root']}`",

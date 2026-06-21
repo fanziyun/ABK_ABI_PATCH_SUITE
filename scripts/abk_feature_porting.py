@@ -2475,7 +2475,7 @@ def _io_uring_reference_root() -> Path:
     env_root = os.environ.get("ABK_MAINLINE_7012_ROOT")
     if env_root:
         return Path(env_root)
-    return Path("/run/media/xingguangcuican/Project/testa/linux")
+    return Path(__file__).resolve().parents[2] / "linux"
 
 
 def _io_uring_module_paths(root: Path, *names: str) -> list[Path]:
@@ -3328,6 +3328,16 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"feature_porting: required file not found: {path}")
 
     reference_root = _io_uring_reference_root()
+    if not reference_root.is_dir():
+        raise SystemExit(
+            f"feature_porting: 7.0.12 reference tree not found: {reference_root}. "
+            "Set ABK_MAINLINE_7012_ROOT or place a linux/ tree at the repo root."
+        )
+    if not (reference_root / "Makefile").is_file():
+        raise SystemExit(
+            f"feature_porting: reference tree is missing Makefile: {reference_root}. "
+            "Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree."
+        )
     io_uring_core_result = patch_io_uring_nowait_core(current_common, reference_root)
     io_uring_rw_net_result = patch_io_uring_nowait_rw_net(current_common, reference_root)
     io_uring_support_result = collect_io_uring_support_modules_status(current_common, reference_root)

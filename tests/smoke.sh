@@ -4,6 +4,7 @@ set -euo pipefail
 MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 COMMON_DIR="${1:-}"
 TMP_DIR="$(mktemp -d "$MODULE_DIR/.tmp-smoke.XXXXXX")"
+REFERENCE_ROOT="$MODULE_DIR/../linux"
 export TMPDIR="$TMP_DIR"
 trap 'rm -rf "$TMP_DIR" "$MODULE_DIR/scripts/__pycache__"' EXIT
 
@@ -16,6 +17,28 @@ if [ ! -d "$COMMON_DIR" ]; then
   printf 'kernel common dir not found: %s\n' "$COMMON_DIR" >&2
   exit 1
 fi
+
+if [ ! -d "$REFERENCE_ROOT" ]; then
+  printf 'reference linux tree not found: %s\n' "$REFERENCE_ROOT" >&2
+  exit 1
+fi
+
+assert_child_rejected() {
+  local child_id="$1"
+  local expected_fragment="$2"
+  local stderr_file="$TMP_DIR/${child_id}.stderr"
+
+  if KERNEL_ROOT="$TMP_DIR/kernel" \
+    DEFCONFIG="$TMP_DIR/defconfig" \
+    CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
+    ABK_MODULE_CHILD_ID="$child_id" \
+    bash "$MODULE_DIR/setup.sh" >/dev/null 2>"$stderr_file"; then
+    printf 'expected child id to be rejected: %s\n' "$child_id" >&2
+    exit 1
+  fi
+
+  grep -Fq "$expected_fragment" "$stderr_file"
+}
 
 bash -n "$MODULE_DIR/setup.sh" "$MODULE_DIR/scripts/libabk.sh" "$MODULE_DIR/scripts/abi_patch_suite.sh"
 
@@ -159,8 +182,8 @@ REPORT_DIR="$TMP_DIR/reports"
 KERNEL_ROOT="$TMP_DIR/kernel" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=dual_abi_kmi_bridge \
-ABK_MAINLINE_7012_ROOT="$MODULE_DIR/../linux" \
+ABK_MODULE_CHILD_ID=abi_bridge \
+ABK_MAINLINE_7012_ROOT="$REFERENCE_ROOT" \
 ABK_ABI_BRIDGE_REPORT_DIR="$REPORT_DIR" \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
@@ -184,34 +207,35 @@ grep -Fq 'allow 7.0.12-family vermagic mismatch' "$TMP_DIR/kernel/common/kernel/
 grep -Fq 'allow 7.0.12-family module_layout mismatch' "$TMP_DIR/kernel/common/kernel/module/version.c"
 grep -Fq 'allow 7.0.12-family symbol CRC mismatch' "$TMP_DIR/kernel/common/kernel/module/version.c"
 grep -Fq 'CONFIG_ABK_DUAL_ABI_BRIDGE' "$TMP_DIR/kernel/common/kernel/module/version.c"
+grep -Fq 'ABK ABI fixups: basic loader compat applied for global 7.0.12-family bridge.' "$TMP_DIR/kernel/common/kernel/module/version.c"
+grep -Fq 'ABK ABI fixups: runtime ABI followups remain deferred beyond loader-adjacent glue.' "$TMP_DIR/kernel/common/kernel/module/version.c"
+grep -Fq 'ABK ABI fixups: basic loader compat is global for 7.0.12-family modules.' "$TMP_DIR/kernel/common/kernel/module/version.c"
 
 REPORT_DIR="$TMP_DIR/reports-experimental"
 KERNEL_ROOT="$TMP_DIR/kernel" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=dual_abi_kmi_bridge \
-ABK_MAINLINE_7012_ROOT="$MODULE_DIR/../linux" \
+ABK_MODULE_CHILD_ID=abi_bridge \
+ABK_MAINLINE_7012_ROOT="$REFERENCE_ROOT" \
 ABK_ABI_BRIDGE_REPORT_DIR="$REPORT_DIR" \
 ABK_ABI_BRIDGE_POLICY=experimental \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
 grep -Fq 'CONFIG_ABK_DUAL_ABI_BRIDGE_EXPERIMENTAL' "$TMP_DIR/kernel/common/kernel/module/version.c"
 
-KERNEL_ROOT="$TMP_DIR/kernel" \
-DEFCONFIG="$TMP_DIR/defconfig" \
-CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=abi_fixups \
-  bash "$MODULE_DIR/setup.sh" >/dev/null
-
-grep -Fq 'ABK ABI fixups: basic loader compat applied for global 7.0.12-family bridge.' "$TMP_DIR/kernel/common/kernel/module/version.c"
-grep -Fq 'ABK ABI fixups: runtime ABI followups remain deferred beyond loader-adjacent glue.' "$TMP_DIR/kernel/common/kernel/module/version.c"
-grep -Fq 'ABK ABI fixups: basic loader compat is global for 7.0.12-family modules.' "$TMP_DIR/kernel/common/kernel/module/version.c"
+assert_child_rejected dual_abi_kmi_bridge "reorganized into 'abi_bridge'"
+assert_child_rejected abi_fixups "reorganized into 'abi_bridge'"
+assert_child_rejected security_update_backport "reorganized into 'security_backport'"
+assert_child_rejected feature_porting "reorganized into 'feature_porting_core'"
+assert_child_rejected feature_porting_phase2 "reorganized into 'feature_porting_backlog'"
+assert_child_rejected network_porting "paused and no longer publicly injectable"
+assert_child_rejected framebuffer_bootlog "paused and no longer publicly injectable"
 
 SECURITY_DIR="$TMP_DIR/security"
 KERNEL_ROOT="$TMP_DIR/kernel" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=security_update_backport \
+ABK_MODULE_CHILD_ID=security_backport \
 ABK_SECURITY_BACKPORT_REPORT_DIR="$SECURITY_DIR" \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
@@ -232,101 +256,12 @@ grep -Fq 'ABK security_update_backport: write-once modules_disabled guard.' "$TM
 grep -Fq '"blk_sync_queue_timer_delete_sync"' "$SECURITY_DIR/security_backport_queue.json"
 grep -Fq '"status": "blocked_by_fixups"' "$SECURITY_DIR/security_backport_queue.json"
 
-NETWORK_DIR="$TMP_DIR/network"
-KERNEL_ROOT="$TMP_DIR/kernel" \
-DEFCONFIG="$TMP_DIR/defconfig" \
-CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=network_porting \
-ABK_MAINLINE_7012_ROOT="$MODULE_DIR/../linux" \
-ABK_NETWORK_PORTING_REPORT_DIR="$NETWORK_DIR" \
-  bash "$MODULE_DIR/setup.sh" >/dev/null
-
-[ -f "$NETWORK_DIR/network_porting_report.md" ]
-[ -f "$NETWORK_DIR/network_porting_report.json" ]
-grep -Fq 'ABK Network Porting Report' "$NETWORK_DIR/network_porting_report.md"
-grep -Fq '"strategy": "minimal_intrusion_graft"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"network_porting_scaffold"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_timestamp_socket_semantics"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_flow_info_cache_ipv6"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_accecn_core"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_accecn_path_fixups"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_driver_dependent_features"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_timestamp_socket_semantics_port"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_flow_info_cache_ipv6_port"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_accecn_core_port"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_accecn_mainline_protocol_port"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"net_driver_dependent_features_status"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"priority": "boot_compatibility_first"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"status": "boot_safe_timestamp_ipv6_main_path_accecn_conservative"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"phase": "flowlabel_dst_cookie_cork_hotpath_main_path"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"phase": "helper_header_and_sysctl_shell_only"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"phase": "boot_safe_mainline_semantics_deferred"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"status": "partial"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"suite_build_utils_hook_available"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq '"blocked_by_driver_scope"' "$NETWORK_DIR/network_porting_report.json"
-grep -Fq 'ABK network_porting: socket/TCP timestamp receive filtering and completion-tstamp semantics aligned without widening into drivers/net.' "$TMP_DIR/kernel/common/net/ipv4/tcp.c"
-grep -Fq 'ABK network_porting: timestamp send/completion reporting is kept inside net/core and net/ipv4 without widening into provider drivers.' "$TMP_DIR/kernel/common/net/core/skbuff.c"
-grep -Fq 'ABK network_porting: IPv6 flow/cache hotpath graft keeps cork-backed flow state and socket dst-cookie reuse in net/ + include/net/ only.' "$TMP_DIR/kernel/common/net/ipv6/inet6_connection_sock.c"
-grep -Fq 'ABK network_porting: bounded AccECN mode/core helper graft fits 6.1 include/net + net/ipv4 anchors without tcp struct growth.' "$TMP_DIR/kernel/common/include/net/tcp.h"
-grep -Fq 'ABK network_porting: bounded AccECN helper graft fits 6.1 without include/linux/tcp.h layout growth.' "$TMP_DIR/kernel/common/include/net/tcp_ecn.h"
-grep -Fq 'ABK network_porting: AccECN path fixups cover child/openreq and syncookie negotiation glue only; request-sock state expansion remains deferred.' "$TMP_DIR/kernel/common/net/ipv4/tcp_minisocks.c"
-grep -Fq 'ABK network_porting: syncookie AccECN glue keeps only ECN-option eligibility inside net/ + include/net/.' "$TMP_DIR/kernel/common/net/ipv4/syncookies.c"
-grep -Fq 'ABK_NET_TS_OPT_RX_FILTER' "$TMP_DIR/kernel/common/include/net/sock.h"
-grep -Fq 'ABK_NET_TS_TX_COMPLETION' "$TMP_DIR/kernel/common/net/socket.c"
-grep -Fq 'sysctl_tcp_ecn_option_beacon' "$TMP_DIR/kernel/common/include/net/netns/ipv4.h"
-grep -Fq 'ip6_autoflowlabel(sock_net(sk), sk);' "$TMP_DIR/kernel/common/net/ipv6/ipv6_sockglue.c"
-grep -Fq 'ip6_autoflowlabel(net, sk), fl6));' "$TMP_DIR/kernel/common/net/ipv6/ip6_output.c"
-! grep -Fq '#include <net/tcp_ecn.h>' "$TMP_DIR/kernel/common/net/ipv4/tcp_input.c"
-! grep -Fq '#include <net/tcp_ecn.h>' "$TMP_DIR/kernel/common/net/ipv4/tcp_output.c"
-! grep -Fq 'ABK network_porting: bounded AccECN receive gate keeps 6.1 on helper-backed mode checks only.' "$TMP_DIR/kernel/common/net/ipv4/tcp_input.c"
-! grep -Fq 'ABK network_porting: bounded AccECN SYN/SYN-ACK send path keeps negotiation inside 6.1 mode bits and sysctls.' "$TMP_DIR/kernel/common/net/ipv4/tcp_output.c"
-! grep -Fq 'ABK network_porting: bounded AccECN retrans/timeouts fall back to RFC3168 before socket timeout escalation.' "$TMP_DIR/kernel/common/net/ipv4/tcp_timer.c"
-! grep -Fq 'ABK network_porting: TCP_INFO reports bounded AccECN mode bits without exposing unsupported 6.1 accounting fields.' "$TMP_DIR/kernel/common/net/ipv4/tcp.c"
-! rg -n 'drivers/net/' "$NETWORK_DIR/network_porting_report.json" >/dev/null
-
-FBLOG_DIR="$TMP_DIR/framebuffer-bootlog"
-KERNEL_ROOT="$TMP_DIR/kernel" \
-DEFCONFIG="$TMP_DIR/defconfig" \
-CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=framebuffer_bootlog \
-ABK_FRAMEBUFFER_BOOTLOG_REPORT_DIR="$FBLOG_DIR" \
-  bash "$MODULE_DIR/setup.sh" >/dev/null
-
-[ -f "$FBLOG_DIR/framebuffer_bootlog_report.md" ]
-[ -f "$FBLOG_DIR/framebuffer_bootlog_report.json" ]
-grep -Fq 'ABK Framebuffer Bootlog Report' "$FBLOG_DIR/framebuffer_bootlog_report.md"
-grep -Fq '"status": "lightweight_framebuffer_bootlog_baseline"' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq '"strategy": "defconfig_and_cmdline_only"' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq '"framebuffer_console_config_enabled"' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq '"cmdline_slots_injected"' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq '"cmdline_status": "console_ttynull_removed"' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq '"cmdline_ttynull_removed": true' "$FBLOG_DIR/framebuffer_bootlog_report.json"
-grep -Fq 'CONFIG_VT=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_VT_CONSOLE=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_DUMMY_CONSOLE=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_FB=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_FRAMEBUFFER_CONSOLE=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_DRM_KMS_HELPER=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_DRM_FBDEV_EMULATION=y' "$TMP_DIR/defconfig"
-grep -Fq 'CONFIG_CMDLINE="stack_depot_disable=on cgroup_disable=pressure bootconfig"' "$TMP_DIR/defconfig"
-grep -Fq 'ABK_FB_BOOTLOG_ARGS=${ABK_FB_BOOTLOG_ARGS:-"console=tty0 fbcon=nodefer vt.global_cursor_default=0 logo.nologo printk.time=1"}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_FB_BOOTLOG_EXTRA_ARGS=${ABK_FB_BOOTLOG_EXTRA_ARGS:-}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_FB_BOOTLOG_APPLY_TO_BOOT_CMDLINE=${ABK_FB_BOOTLOG_APPLY_TO_BOOT_CMDLINE:-1}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_FB_BOOTLOG_STRIP_TTYNULL=${ABK_FB_BOOTLOG_STRIP_TTYNULL:-1}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'KERNEL_VENDOR_CMDLINE+=" ${ABK_FB_BOOTLOG_CMDLINE}"' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'KERNEL_CMDLINE+=" ${ABK_FB_BOOTLOG_CMDLINE}"' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq "sed -E 's/(^| )console=ttynull( |$)/ /g; s/[[:space:]]+/ /g; s/^ //; s/ \$//'" "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_FB_BOOTLOG_BOOTCONFIG_PARAMS' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_GKI_FB_BOOTLOG_ARGS=${ABK_GKI_FB_BOOTLOG_ARGS:-${ABK_FB_BOOTLOG_ARGS:-"console=tty0 fbcon=nodefer vt.global_cursor_default=0 logo.nologo printk.time=1"}}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'ABK_GKI_FB_BOOTLOG_STRIP_TTYNULL=${ABK_GKI_FB_BOOTLOG_STRIP_TTYNULL:-${ABK_FB_BOOTLOG_STRIP_TTYNULL:-1}}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-grep -Fq 'GKI_KERNEL_CMDLINE+=" ${ABK_GKI_FB_BOOTLOG_CMDLINE}"' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
-
 FEATURE_DIR="$TMP_DIR/feature"
 KERNEL_ROOT="$TMP_DIR/kernel" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=feature_porting \
-ABK_MAINLINE_7012_ROOT="$MODULE_DIR/../linux" \
+ABK_MODULE_CHILD_ID=feature_porting_core \
+ABK_MAINLINE_7012_ROOT="$REFERENCE_ROOT" \
 ABK_FEATURE_PORTING_REPORT_DIR="$FEATURE_DIR" \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
@@ -550,51 +485,51 @@ FEATURE_PHASE2_DIR="$TMP_DIR/feature-phase2"
 KERNEL_ROOT="$TMP_DIR/kernel" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
-ABK_MODULE_CHILD_ID=feature_porting_phase2 \
-ABK_MAINLINE_7012_ROOT="$MODULE_DIR/../linux" \
+ABK_MODULE_CHILD_ID=feature_porting_backlog \
+ABK_MAINLINE_7012_ROOT="$REFERENCE_ROOT" \
 ABK_FEATURE_PORTING_PHASE2_REPORT_DIR="$FEATURE_PHASE2_DIR" \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
-[ -f "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.md" ]
-[ -f "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json" ]
-grep -Fq 'ABK Feature Porting Phase 2 Report' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.md"
-grep -Fq '"status": "single_large_batch_structured_convergence"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"strategy": "single_large_batch_with_layered_landings"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"phase": "feature_porting_phase2_batch2"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"allowed_statuses": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"batch_items": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"active_follow_up_items": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"planned_batch_layers": {' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"batch_layers": {' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"feature_porting_phase2_batch2"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"tcp_socket_layout_reduction"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"ipv6_tcp_output_path"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"io_uring_cbpf_filters"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"io_uring_non_circular_sq"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"io_uring_large_rx_buffer_zcrx"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"bpf_timer_bpf_wq_lockless"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"status": "blocked_by_layout"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"status": "report_only"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"status": "partial"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json" || \
-grep -Fq '"status": "blocked_by_missing_anchor"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"phase": "bounded_anchor_tracking_only"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"status_counts": {' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"excluded_backlog": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"AccECN"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"false-sharing \u6d88\u9664"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"paused_children": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"network_porting"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"framebuffer_bootlog"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"executable_items": [' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-grep -Fq '"io_uring_cbpf_filters"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
+[ -f "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.md" ]
+[ -f "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json" ]
+grep -Fq 'ABK Feature Porting Backlog Report' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.md"
+grep -Fq '"status": "single_large_batch_structured_convergence"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"strategy": "single_large_batch_with_layered_landings"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"phase": "feature_porting_backlog_batch2"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"allowed_statuses": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"batch_items": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"active_follow_up_items": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"planned_batch_layers": {' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"batch_layers": {' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"feature_porting_backlog_batch2"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"tcp_socket_layout_reduction"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"ipv6_tcp_output_path"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"io_uring_cbpf_filters"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"io_uring_non_circular_sq"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"io_uring_large_rx_buffer_zcrx"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"bpf_timer_bpf_wq_lockless"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"status": "blocked_by_layout"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"status": "report_only"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"status": "partial"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json" || \
+grep -Fq '"status": "blocked_by_missing_anchor"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"phase": "bounded_anchor_tracking_only"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"status_counts": {' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"excluded_backlog": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"AccECN"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"false-sharing \u6d88\u9664"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"paused_children": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"network_porting"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"framebuffer_bootlog"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"executable_items": [' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+grep -Fq '"io_uring_cbpf_filters"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
 if [ -f "$TMP_DIR/kernel/common/io_uring/register.c" ] && [ -f "$TMP_DIR/kernel/common/io_uring/bpf_filter.c" ]; then
-  grep -Fq '"phase": "ring_level_filter_wiring_grafted"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "sq_array_gate_helper_split_only"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "preparatory_rx_anchor_bounded"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json" || \
-  grep -Fq '"phase": "legacy_io_uring_layout_without_zcrx_surface"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "helper_side_async_routing_tightened"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json" || \
-  grep -Fq '"phase": "legacy_bpf_timer_only"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"executable": true' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
+  grep -Fq '"phase": "ring_level_filter_wiring_grafted"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "sq_array_gate_helper_split_only"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "preparatory_rx_anchor_bounded"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json" || \
+  grep -Fq '"phase": "legacy_io_uring_layout_without_zcrx_surface"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "helper_side_async_routing_tightened"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json" || \
+  grep -Fq '"phase": "legacy_bpf_timer_only"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"executable": true' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
   grep -Fq 'ABK feature_porting_phase2: bounded io_uring cBPF filter activation keeps' "$TMP_DIR/kernel/common/io_uring/io_uring.h"
   grep -Fq 'io_activate_bpf_filters(ctx, &ctx->restrictions);' "$TMP_DIR/kernel/common/io_uring/register.c"
   grep -Fq 'io_activate_bpf_filters(ctx, dst);' "$TMP_DIR/kernel/common/io_uring/io_uring.c"
@@ -608,12 +543,12 @@ if [ -f "$TMP_DIR/kernel/common/io_uring/register.c" ] && [ -f "$TMP_DIR/kernel/
     grep -Fq 'if (bpf_async_use_direct_start()) {' "$TMP_DIR/kernel/common/kernel/bpf/helpers.c"
   fi
 else
-  grep -Fq '"phase": "legacy_io_uring_layout_without_support_module"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "legacy_io_uring_layout_without_sqarray_gate"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "legacy_io_uring_layout_without_zcrx_surface"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"phase": "legacy_bpf_timer_only"' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
-  grep -Fq '"blocked_by_missing_anchor": true' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json"
+  grep -Fq '"phase": "legacy_io_uring_layout_without_support_module"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "legacy_io_uring_layout_without_sqarray_gate"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "legacy_io_uring_layout_without_zcrx_surface"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"phase": "legacy_bpf_timer_only"' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
+  grep -Fq '"blocked_by_missing_anchor": true' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json"
 fi
-! rg -n 'page_pool|netdev|drivers/net' "$FEATURE_PHASE2_DIR/feature_porting_phase2_report.json" >/dev/null
+! rg -n 'page_pool|netdev|drivers/net' "$FEATURE_PHASE2_DIR/feature_porting_backlog_report.json" >/dev/null
 
 printf 'smoke ok\n'

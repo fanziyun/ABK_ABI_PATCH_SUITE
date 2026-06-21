@@ -1,25 +1,21 @@
-# Completed Checklist
+# Public Surface
 
-- nohz 字段改进
-- avg_idle Preemption 模式简化
-- Swap Table Phase II Large folios 批量回收
-- Slab 优化
-- Hugepage 分配加速
-- io_uring NOWAIT 扩展与新子模块回移
-- feature_porting_phase2 子模块
-- timestamp 更新
-- network_porting 起机优先收口
-- framebuffer_bootlog 子模块
-- framebuffer_bootlog 收口
-- open/close 热点路径
-- close_range() 优化
-- pid 分配优化
-- flow info 缓存
-- cBPF filters for io_uring
-- Non-circular SQ
-- Large RX buffer support（zcrx）
-- blk-mq async_depth
-- zram compressed writeback
-- 7.0.12 ko 全局加载兼容
-- BTF binary search 优化
-- bpf_timer/bpf_wq 无锁化
+Public module-set child ids:
+
+- `display_release_spoof`
+- `abi_bridge`
+- `security_backport`
+- `feature_porting_core`
+- `feature_porting_backlog`
+
+Legacy ids are rejected with migration guidance.
+
+Paused implementations are intentionally not exposed:
+
+- `network_porting`
+- `framebuffer_bootlog`
+
+Reference-tree injection is environment-driven:
+
+- `ABK_MAINLINE_7012_ROOT`
+- or repo-local `./linux`

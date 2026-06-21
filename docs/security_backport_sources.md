@@ -3,7 +3,7 @@
 ## Purpose
 
 Track the fixed `7.0.12-first` security source baseline and the executable
-low-risk batch registry for `security_update_backport`.
+low-risk batch registry for `security_backport`.
 
 ## Source Policy
 

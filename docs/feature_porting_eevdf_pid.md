@@ -101,7 +101,7 @@ If escalation becomes necessary, the next batch should explicitly add:
 ## PID Boundary
 
 PID allocation optimization belongs to `feature_porting`, not
-`dual_abi_kmi_bridge`.
+`abi_bridge`.
 
 `pidfd_preparation_compat` also belongs to `feature_porting`, but only as a
 helper/report-level compat line.
@@ -121,7 +121,7 @@ Current pidfd compat boundary:
 If later PID migration introduces ABI glue needs:
 
 - keep the main port here
-- move only narrow compatibility glue into `abi_fixups`
+- move only narrow compatibility glue into `abi_bridge`
 
 ## Patch Series Shape
 

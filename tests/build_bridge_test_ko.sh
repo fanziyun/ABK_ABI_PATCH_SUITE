@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MAINLINE_ROOT="${1:-/run/media/xingguangcuican/Project/testa/linux}"
+MAINLINE_ROOT="${1:-${ABK_MAINLINE_7012_ROOT:-$MODULE_DIR/../../linux}}"
 OUT_DIR="${2:-$MODULE_DIR/out}"
 KBUILD_OUT="${3:-$OUT_DIR/build}"
 TARGET_ARCH="${ABK_BRIDGE_TEST_ARCH:-arm64}"

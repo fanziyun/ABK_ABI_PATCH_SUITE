@@ -17,7 +17,7 @@ class PatchGroup:
 
 PATCH_GROUPS = (
     PatchGroup(
-        "feature_porting_phase2_batch2",
+        "feature_porting_backlog_batch2",
         "Single large batch for the six remaining non-paused phase2 items, with fixed landing strength per item.",
     ),
     PatchGroup(
@@ -45,7 +45,7 @@ PATCH_GROUPS = (
         "Keep bpf_timer/bpf_wq lockless follow-ups inside helper-side async path tightening only.",
     ),
     PatchGroup(
-        "feature_porting_phase2_fixups",
+        "feature_porting_backlog_fixups",
         "Reserve later scope-expanding follow-up batches for items intentionally left partial or report-only here.",
     ),
 )
@@ -74,9 +74,11 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 
 def reference_root() -> Path:
-    root = Path(os.environ.get("ABK_MAINLINE_7012_ROOT", "linux"))
-    if not root.is_absolute():
-        root = Path.cwd() / root
+    env_root = os.environ.get("ABK_MAINLINE_7012_ROOT")
+    if env_root:
+        root = Path(env_root)
+    else:
+        root = Path(__file__).resolve().parents[2] / "linux"
     return root
 
 
@@ -811,7 +813,7 @@ def build_report(
         "reference_root": str(reference_root()),
         "status": "single_large_batch_structured_convergence",
         "strategy": "single_large_batch_with_layered_landings",
-        "phase": "feature_porting_phase2_batch2",
+        "phase": "feature_porting_backlog_batch2",
         "allowed_statuses": [
             STATUS_REPORT_ONLY,
             STATUS_PARTIAL,
@@ -860,10 +862,10 @@ def build_report(
             for group in PATCH_GROUPS
         ],
         "applied_groups": [
-            "feature_porting_phase2_batch2",
+            "feature_porting_backlog_batch2",
         ] + executable_keys,
         "deferred_groups": [
-            "feature_porting_phase2_fixups",
+            "feature_porting_backlog_fixups",
         ],
         "items": items,
         "status_counts": counts,
@@ -889,12 +891,12 @@ def build_report(
     }
 
     write_text(
-        output_dir / "feature_porting_phase2_report.json",
+        output_dir / "feature_porting_backlog_report.json",
         json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
     )
     write_text(
-        output_dir / "feature_porting_phase2_report.md",
-        "# ABK Feature Porting Phase 2 Report\n\n"
+        output_dir / "feature_porting_backlog_report.md",
+        "# ABK Feature Porting Backlog Report\n\n"
         f"- Generated: `{report['generated_at_utc']}`\n"
         f"- Current tree: `{report['current_common_root']}`\n"
         f"- Reference tree: `{report['reference_root']}`\n"
@@ -949,7 +951,18 @@ def main(argv: list[str]) -> int:
         current_common / "net/ipv6/inet6_connection_sock.c",
     ):
         if not path.exists():
-            raise SystemExit(f"feature_porting_phase2: required file not found: {path}")
+            raise SystemExit(f"feature_porting_backlog: required file not found: {path}")
+
+    if not ref_root.is_dir():
+        raise SystemExit(
+            f"feature_porting_backlog: 7.0.12 reference tree not found: {ref_root}. "
+            "Set ABK_MAINLINE_7012_ROOT or place a linux/ tree at the repo root."
+        )
+    if not (ref_root / "Makefile").is_file():
+        raise SystemExit(
+            f"feature_porting_backlog: reference tree is missing Makefile: {ref_root}. "
+            "Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree."
+        )
 
     cbpf_result = patch_io_uring_cbpf(current_common)
     non_circular_result = patch_non_circular_sq(current_common)

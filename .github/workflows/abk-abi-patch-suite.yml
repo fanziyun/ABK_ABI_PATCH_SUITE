@@ -1,0 +1,64 @@
+name: ABK ABI Patch Suite
+
+on:
+  push:
+    paths:
+      - ".github/workflows/abk-abi-patch-suite.yml"
+      - "module.conf"
+      - "setup.sh"
+      - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "test.md"
+  pull_request:
+    paths:
+      - ".github/workflows/abk-abi-patch-suite.yml"
+      - "module.conf"
+      - "setup.sh"
+      - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "test.md"
+  workflow_dispatch:
+
+env:
+  TARGET_LINUX_REPO: https://android.googlesource.com/kernel/common
+  TARGET_LINUX_REF: android14-6.1
+  REFERENCE_LINUX_REPO: https://github.com/archlinux/linux
+  REFERENCE_LINUX_REF: build-v7.0.12
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ABK_ABI_PATCH_SUITE
+
+    steps:
+      - name: Checkout module repo
+        uses: actions/checkout@v4
+        with:
+          path: ABK_ABI_PATCH_SUITE
+
+      - name: Clone target Android 14 / 6.1 tree
+        run: |
+          git clone --depth 1 --branch "$TARGET_LINUX_REF" "$TARGET_LINUX_REPO" "$GITHUB_WORKSPACE/target/linux"
+
+      - name: Clone 7.0.12 reference tree
+        run: |
+          git clone --depth 1 --branch "$REFERENCE_LINUX_REF" "$REFERENCE_LINUX_REPO" "$GITHUB_WORKSPACE/reference/linux"
+
+      - name: Python compile check
+        run: |
+          python3 -m py_compile scripts/*.py
+
+      - name: Shell syntax check
+        run: |
+          bash -n setup.sh scripts/*.sh tests/smoke.sh
+
+      - name: Smoke test
+        env:
+          ABK_MAINLINE_7012_ROOT: ${{ github.workspace }}/reference/linux
+        run: |
+          bash tests/smoke.sh "$GITHUB_WORKSPACE/target/linux/common"

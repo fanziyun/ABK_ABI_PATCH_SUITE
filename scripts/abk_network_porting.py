@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -135,13 +134,6 @@ def graft_metadata(
         "new_interface_used": new_interface_used,
         "new_interface_scope": new_interface_scope,
     }
-
-
-def _mainline_root() -> Path:
-    root = Path(os.environ.get("ABK_MAINLINE_7012_ROOT", "linux"))
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root
 
 
 def patch_timestamp_socket_semantics(common_root: Path) -> dict[str, object]:

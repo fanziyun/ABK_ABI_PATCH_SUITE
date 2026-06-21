@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 
+ABK_ABI_PATCH_SUITE_PUBLIC_CHILDREN=(
+  display_release_spoof
+  abi_bridge
+  security_backport
+  feature_porting_core
+  feature_porting_backlog
+)
+
+abk_abi_patch_suite_mainline_root() {
+  local module_parent
+  local candidate
+
+  if [ -n "${ABK_MAINLINE_7012_ROOT:-}" ]; then
+    candidate="$ABK_MAINLINE_7012_ROOT"
+  else
+    module_parent="$(cd "$MODULE_DIR/.." && pwd)"
+    candidate="$module_parent/linux"
+  fi
+
+  printf '%s\n' "$candidate"
+}
+
 abk_abi_patch_suite_common_dir() {
   abk_common_dir
 }
@@ -31,10 +53,12 @@ abk_abi_patch_suite_apply_display_release_spoof() {
 }
 
 abk_abi_patch_suite_require_mainline_7012() {
-  local mainline_root="${ABK_MAINLINE_7012_ROOT:-/run/media/xingguangcuican/Project/testa/linux}"
+  local mainline_root
   local kernelversion
 
-  abk_require_dir "$mainline_root"
+  mainline_root="$(abk_abi_patch_suite_mainline_root)"
+
+  [ -d "$mainline_root" ] || abk_die "7.0.12 reference tree not found: $mainline_root. Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree or place one at ./linux relative to the repo root."
   abk_require_file "$mainline_root/Makefile"
   kernelversion="$(make -s -C "$mainline_root" kernelversion 2>/dev/null || true)"
   [ -n "$kernelversion" ] || abk_die "unable to resolve kernelversion for mainline tree: $mainline_root"
@@ -52,7 +76,7 @@ abk_abi_patch_suite_bridge_report_dir() {
   if [ -n "${ABK_ABI_BRIDGE_REPORT_DIR:-}" ]; then
     printf '%s\n' "$ABK_ABI_BRIDGE_REPORT_DIR"
   else
-    printf '%s/abk_abi_patch_suite_reports/dual_abi_kmi_bridge\n' "$KERNEL_ROOT"
+    printf '%s/abk_abi_patch_suite_reports/abi_bridge\n' "$KERNEL_ROOT"
   fi
 }
 
@@ -76,9 +100,9 @@ abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
   local mainline_root
   local report_dir
 
-  abk_log "apply child: dual_abi_kmi_bridge"
+  abk_log "apply child: abi_bridge (bridge preflight + loader bridge)"
   common_dir="$(abk_abi_patch_suite_common_dir)"
-  mainline_root="${ABK_MAINLINE_7012_ROOT:-/run/media/xingguangcuican/Project/testa/linux}"
+  mainline_root="$(abk_abi_patch_suite_mainline_root)"
   report_dir="$(abk_abi_patch_suite_bridge_report_dir)"
 
   abk_require_file "$common_dir/kernel/module/version.c"
@@ -98,8 +122,8 @@ abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
     python3 "$MODULE_DIR/scripts/abk_dual_abi_bridge_apply.py" \
       "$common_dir" \
       "$(abk_abi_patch_suite_bridge_policy)"
-  abk_log "dual ABI/KMI bridge report: $report_dir"
-  abk_log "dual ABI/KMI bridge patches applied ($(abk_abi_patch_suite_bridge_policy))"
+  abk_log "ABI bridge report: $report_dir"
+  abk_log "ABI bridge loader policy applied ($(abk_abi_patch_suite_bridge_policy))"
 }
 
 abk_abi_patch_suite_apply_abi_fixups() {
@@ -117,7 +141,7 @@ abk_abi_patch_suite_security_report_dir() {
   if [ -n "${ABK_SECURITY_BACKPORT_REPORT_DIR:-}" ]; then
     printf '%s\n' "$ABK_SECURITY_BACKPORT_REPORT_DIR"
   else
-    printf '%s/abk_abi_patch_suite_reports/security_update_backport\n' "$KERNEL_ROOT"
+    printf '%s/abk_abi_patch_suite_reports/security_backport\n' "$KERNEL_ROOT"
   fi
 }
 
@@ -125,7 +149,7 @@ abk_abi_patch_suite_feature_porting_report_dir() {
   if [ -n "${ABK_FEATURE_PORTING_REPORT_DIR:-}" ]; then
     printf '%s\n' "$ABK_FEATURE_PORTING_REPORT_DIR"
   else
-    printf '%s/abk_abi_patch_suite_reports/feature_porting\n' "$KERNEL_ROOT"
+    printf '%s/abk_abi_patch_suite_reports/feature_porting_core\n' "$KERNEL_ROOT"
   fi
 }
 
@@ -141,7 +165,7 @@ abk_abi_patch_suite_feature_porting_phase2_report_dir() {
   if [ -n "${ABK_FEATURE_PORTING_PHASE2_REPORT_DIR:-}" ]; then
     printf '%s\n' "$ABK_FEATURE_PORTING_PHASE2_REPORT_DIR"
   else
-    printf '%s/abk_abi_patch_suite_reports/feature_porting_phase2\n' "$KERNEL_ROOT"
+    printf '%s/abk_abi_patch_suite_reports/feature_porting_backlog\n' "$KERNEL_ROOT"
   fi
 }
 
@@ -157,21 +181,21 @@ abk_abi_patch_suite_apply_security_update_backport() {
   local common_dir
   local output_dir
 
-  abk_log "apply child: security_update_backport"
+  abk_log "apply child: security_backport"
   common_dir="$(abk_abi_patch_suite_common_dir)"
   output_dir="$(abk_abi_patch_suite_security_report_dir)"
   mkdir -p "$output_dir"
   python3 "$MODULE_DIR/scripts/abk_security_update_backport.py" \
     "$common_dir" \
     "$output_dir"
-  abk_log "security update backport batch applied and reported: $output_dir"
+  abk_log "security backport batch applied and reported: $output_dir"
 }
 
 abk_abi_patch_suite_apply_feature_porting() {
   local common_dir
   local output_dir
 
-  abk_log "apply child: feature_porting"
+  abk_log "apply child: feature_porting_core"
   common_dir="$(abk_abi_patch_suite_common_dir)"
   output_dir="$(abk_abi_patch_suite_feature_porting_report_dir)"
   abk_abi_patch_suite_require_mainline_7012
@@ -208,14 +232,14 @@ abk_abi_patch_suite_apply_feature_porting() {
   python3 "$MODULE_DIR/scripts/abk_feature_porting.py" \
     "$common_dir" \
     "$output_dir"
-  abk_log "feature porting runtime-state migration applied: $output_dir"
+  abk_log "feature porting core migration applied: $output_dir"
 }
 
 abk_abi_patch_suite_apply_feature_porting_phase2() {
   local common_dir
   local output_dir
 
-  abk_log "apply child: feature_porting_phase2"
+  abk_log "apply child: feature_porting_backlog"
   common_dir="$(abk_abi_patch_suite_common_dir)"
   output_dir="$(abk_abi_patch_suite_feature_porting_phase2_report_dir)"
   abk_abi_patch_suite_require_mainline_7012
@@ -239,7 +263,7 @@ abk_abi_patch_suite_apply_feature_porting_phase2() {
   python3 "$MODULE_DIR/scripts/abk_feature_porting_phase2.py" \
     "$common_dir" \
     "$output_dir"
-  abk_log "feature_porting_phase2 single-large-batch convergence applied: $output_dir"
+  abk_log "feature porting backlog convergence applied: $output_dir"
 }
 
 abk_abi_patch_suite_apply_network_porting() {
@@ -297,6 +321,37 @@ abk_abi_patch_suite_apply_framebuffer_bootlog() {
   abk_log "framebuffer bootlog baseline applied: $output_dir"
 }
 
+abk_abi_patch_suite_apply_abi_bridge() {
+  abk_abi_patch_suite_apply_dual_abi_kmi_bridge
+  abk_abi_patch_suite_apply_abi_fixups
+  abk_log "ABI bridge child completed: bridge preflight, loader policy, and loader-adjacent fixups"
+}
+
+abk_abi_patch_suite_child_migration_error() {
+  local child_id="$1"
+
+  case "$child_id" in
+    dual_abi_kmi_bridge|abi_fixups)
+      abk_die "ABK module-set child id '$child_id' was reorganized into 'abi_bridge'. Use set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#abi_bridge;after_patch"
+      ;;
+    security_update_backport)
+      abk_die "ABK module-set child id '$child_id' was reorganized into 'security_backport'. Use set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#security_backport;after_patch"
+      ;;
+    feature_porting)
+      abk_die "ABK module-set child id '$child_id' was reorganized into 'feature_porting_core'. Use set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#feature_porting_core;after_patch"
+      ;;
+    feature_porting_phase2)
+      abk_die "ABK module-set child id '$child_id' was reorganized into 'feature_porting_backlog'. Use set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#feature_porting_backlog;after_patch"
+      ;;
+    network_porting|framebuffer_bootlog)
+      abk_die "ABK module-set child id '$child_id' is paused and no longer publicly injectable from module.conf. Its implementation remains in-tree, but the default module_set catalog does not expose it."
+      ;;
+    *)
+      abk_die "unsupported ABK module-set child id: $child_id. Supported child ids: ${ABK_ABI_PATCH_SUITE_PUBLIC_CHILDREN[*]}"
+      ;;
+  esac
+}
+
 abk_abi_patch_suite_apply_child() {
   local child_id="$1"
 
@@ -304,29 +359,20 @@ abk_abi_patch_suite_apply_child() {
     display_release_spoof)
       abk_abi_patch_suite_apply_display_release_spoof
       ;;
-    dual_abi_kmi_bridge)
-      abk_abi_patch_suite_apply_dual_abi_kmi_bridge
+    abi_bridge)
+      abk_abi_patch_suite_apply_abi_bridge
       ;;
-    abi_fixups)
-      abk_abi_patch_suite_apply_abi_fixups
-      ;;
-    security_update_backport)
+    security_backport)
       abk_abi_patch_suite_apply_security_update_backport
       ;;
-    feature_porting)
+    feature_porting_core)
       abk_abi_patch_suite_apply_feature_porting
       ;;
-    feature_porting_phase2)
+    feature_porting_backlog)
       abk_abi_patch_suite_apply_feature_porting_phase2
       ;;
-    network_porting)
-      abk_abi_patch_suite_apply_network_porting
-      ;;
-    framebuffer_bootlog)
-      abk_abi_patch_suite_apply_framebuffer_bootlog
-      ;;
     *)
-      abk_die "unsupported ABK module-set child id: $child_id"
+      abk_abi_patch_suite_child_migration_error "$child_id"
       ;;
   esac
 }
