@@ -174,11 +174,7 @@ def replace_scope(text: str, start: str, end: str, new: str, label: str) -> str:
     return text[:start_idx] + new + text[end_idx:]
 
 
-def find_c_block(text: str, start: str, label: str) -> tuple[int, int]:
-    start_idx = text.find(start)
-    if start_idx < 0:
-        raise SystemExit(f"{label}: start anchor missing")
-
+def find_c_block_from_index(text: str, start_idx: int, label: str) -> tuple[int, int]:
     brace_idx = text.find("{", start_idx)
     if brace_idx < 0:
         raise SystemExit(f"{label}: opening brace missing")
@@ -222,6 +218,20 @@ def find_c_block(text: str, start: str, label: str) -> tuple[int, int]:
         idx += 1
 
     raise SystemExit(f"{label}: closing brace missing")
+
+
+def find_c_block(text: str, start: str, label: str) -> tuple[int, int]:
+    start_idx = text.find(start)
+    if start_idx < 0:
+        raise SystemExit(f"{label}: start anchor missing")
+    return find_c_block_from_index(text, start_idx, label)
+
+
+def find_c_block_regex(text: str, pattern: str, label: str) -> tuple[int, int]:
+    match = re.search(pattern, text, re.MULTILINE)
+    if not match:
+        raise SystemExit(f"{label}: start anchor missing")
+    return find_c_block_from_index(text, match.start(), label)
 
 
 def bool_status(value: bool) -> str:
@@ -1018,6 +1028,7 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     file_c = common_root / "fs/file.c"
     text = read_text(file_c)
     marker = "/* ABK feature_porting: fd allocation hotpath helper graft. */"
+    alloc_signature_pattern = r"static\s+struct\s+fdtable\s*\*\s*alloc_fdtable\s*\(\s*unsigned\s+int\s+nr\s*\)"
 
     if marker in text:
         return {
@@ -1042,7 +1053,10 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             ],
         }
 
-    ensure_contains(file_c, "static struct fdtable * alloc_fdtable(unsigned int nr)", "feature_porting/fd_alloc")
+    if not re.search(alloc_signature_pattern, text, re.MULTILINE):
+        raise SystemExit(
+            f"feature_porting/fd_alloc: expected anchor missing in {file_c}: alloc_fdtable(unsigned int nr)"
+        )
     ensure_contains(file_c, "static int expand_fdtable(struct files_struct *files, unsigned int nr)", "feature_porting/fd_alloc")
     ensure_contains(file_c, "static int expand_files(struct files_struct *files, unsigned int nr)", "feature_porting/fd_alloc")
     ensure_contains(file_c, "int get_unused_fd_flags(unsigned flags)", "feature_porting/fd_alloc")
@@ -1057,17 +1071,49 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             anchor = helper_match.group(0)
             text = replace_once(text, anchor, anchor + "\n" + helper_block, "feature_porting/fd_alloc_helpers")
         else:
-            alloc_anchor = "static struct fdtable * alloc_fdtable(unsigned int nr)\n{"
-            text = replace_once(
-                text,
-                alloc_anchor,
-                helper_block + "\n" + alloc_anchor,
-                "feature_porting/fd_alloc_helpers",
-            )
+            alloc_match = re.search(alloc_signature_pattern, text, re.MULTILINE)
+            if not alloc_match:
+                raise SystemExit("feature_porting/fd_alloc_helpers: alloc_fdtable() anchor missing")
+            text = text[:alloc_match.start()] + helper_block + "\n" + text[alloc_match.start():]
 
     alloc_old = """static struct fdtable * alloc_fdtable(unsigned int nr)\n{\n\tstruct fdtable *fdt;\n\tvoid *data;\n\n\t/*\n\t * Figure out how many fds we actually want to support in this fdtable.\n\t * Allocation steps are keyed to the size of the fdarray, since it\n\t * grows far faster than any of the other dynamic data. We try to fit\n\t * the fdarray into comfortable page-tuned chunks: starting at 1024B\n\t * and growing in powers of two from there on.\n\t */\n\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n\t/*\n\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open\n\t * had been set lower between the check in expand_files() and here.  Deal\n\t * with that in caller, it's cheaper that way.\n\t *\n\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise\n\t * bitmaps handling below becomes unpleasant, to put it mildly...\n\t */\n\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n\n\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);\n\tif (!fdt)\n\t\tgoto out;\n\tfdt->max_fds = nr;\n\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_fdt;\n\tfdt->fd = data;\n\n\tdata = kvmalloc(max_t(size_t,\n\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),\n\t\t\t\t GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_arr;\n\tfdt->open_fds = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->close_on_exec = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->full_fds_bits = data;\n\n\treturn fdt;\n\nout_arr:\n\tkvfree(fdt->fd);\nout_fdt:\n\tkfree(fdt);\nout:\n\treturn NULL;\n}\n"""
     alloc_new = """static struct fdtable * alloc_fdtable(unsigned int nr)\n{\n\tstruct fdtable *fdt;\n\tunsigned int slots_wanted = abk_fdtable_slots_wanted(nr);\n\tvoid *data;\n\n\t/*\n\t * Keep the legacy file-local interface shape, but derive capacity from\n\t * the requested slot count before dropping into the allocator.\n\t */\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n\t/*\n\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open\n\t * had been set lower between the check in expand_files() and here.  Deal\n\t * with that in caller, it's cheaper that way.\n\t *\n\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise\n\t * bitmaps handling below becomes unpleasant, to put it mildly...\n\t */\n\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))\n\t\treturn NULL;\n\n\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);\n\tif (!fdt)\n\t\tgoto out;\n\tfdt->max_fds = nr;\n\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_fdt;\n\tfdt->fd = data;\n\n\tdata = kvmalloc(max_t(size_t,\n\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),\n\t\t\t\t GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_arr;\n\tfdt->open_fds = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->close_on_exec = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->full_fds_bits = data;\n\n\treturn fdt;\n\nout_arr:\n\tkvfree(fdt->fd);\nout_fdt:\n\tkfree(fdt);\nout:\n\treturn NULL;\n}\n"""
-    text = replace_once(text, alloc_old, alloc_new, "feature_porting/fd_alloc_alloc_fdtable")
+    if alloc_old in text:
+        text = replace_once(text, alloc_old, alloc_new, "feature_porting/fd_alloc_alloc_fdtable")
+    else:
+        alloc_start, alloc_end = find_c_block_regex(text, alloc_signature_pattern, "feature_porting/fd_alloc_alloc_fdtable")
+        alloc_scope = text[alloc_start:alloc_end]
+        alloc_original_scope = alloc_scope
+        capacity_old = """\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n"""
+        capacity_new = """\tslots_wanted = abk_fdtable_slots_wanted(nr);\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n"""
+        sysctl_guard = """\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n"""
+        sysctl_guard_new = (
+            sysctl_guard
+            + "\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))\n"
+            + "\t\treturn NULL;\n"
+        )
+
+        if "unsigned int slots_wanted;" not in alloc_scope and "unsigned int slots_wanted = " not in alloc_scope:
+            brace_idx = alloc_scope.find("{")
+            if brace_idx < 0:
+                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: opening brace missing")
+            tail = alloc_scope[brace_idx + 1 :]
+            if tail.startswith("\n"):
+                tail = tail[1:]
+            alloc_scope = alloc_scope[: brace_idx + 1] + "\n\tunsigned int slots_wanted;\n" + tail
+
+        if capacity_old in alloc_scope:
+            alloc_scope = alloc_scope.replace(capacity_old, capacity_new, 1)
+        elif "slots_wanted = abk_fdtable_slots_wanted(nr);" not in alloc_scope or "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n" not in alloc_scope:
+            raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
+
+        if "INT_MAX / sizeof(struct file *)" not in alloc_scope:
+            if sysctl_guard not in alloc_scope:
+                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected sysctl guard missing")
+            alloc_scope = alloc_scope.replace(sysctl_guard, sysctl_guard_new, 1)
+
+        if alloc_scope != alloc_original_scope:
+            text = text[:alloc_start] + alloc_scope + text[alloc_end:]
 
     expand_files_old = """repeat:\n\tfdt = files_fdtable(files);\n\n\t/* Do we need to expand? */\n\tif (nr < fdt->max_fds)\n\t\treturn expanded;\n\n\t/* Can we expand? */\n\tif (nr >= sysctl_nr_open)\n\t\treturn -EMFILE;\n"""
     expand_files_new = """repeat:\n\tfdt = files_fdtable(files);\n\n\t/* Do we need to expand? */\n\tif (!abk_expand_files_needed(fdt, nr))\n\t\treturn expanded;\n\n\t/* Can we expand? */\n\tif (nr >= sysctl_nr_open)\n\t\treturn -EMFILE;\n"""
@@ -1293,9 +1339,13 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
         blk_mq_text = replace_once(blk_mq_text, blk_mq_init_queue_old, blk_mq_init_queue_new, "feature_porting/blk_async_depth_blk_mq_queue_init")
 
     blk_mq_resize_old = """\tif (!ret) {\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
-    blk_mq_resize_new = """\tif (!ret) {\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tq->async_depth = max(q->async_depth * nr / q->nr_requests, 1U);\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
-    if "preserve relative async_depth across nr_requests resize" not in blk_mq_text:
-        blk_mq_text = replace_once(blk_mq_text, blk_mq_resize_old, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
+    blk_mq_resize_bad = """\tif (!ret) {\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tq->async_depth = max(q->async_depth * nr / q->nr_requests, 1U);\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
+    blk_mq_resize_new = """\tif (!ret) {\n\t\tunsigned long new_async_depth;\n\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tnew_async_depth = q->async_depth * nr / q->nr_requests;\n\t\tif (!new_async_depth)\n\t\t\tnew_async_depth = 1;\n\t\tq->async_depth = min_t(unsigned long, new_async_depth, UINT_MAX);\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
+    if "new_async_depth = q->async_depth * nr / q->nr_requests;" not in blk_mq_text:
+        if blk_mq_resize_bad in blk_mq_text:
+            blk_mq_text = replace_once(blk_mq_text, blk_mq_resize_bad, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
+        else:
+            blk_mq_text = replace_once(blk_mq_text, blk_mq_resize_old, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
         write_text(blk_mq_c, blk_mq_text)
 
     blk_mq_sched_none_old = """\tif (!e) {\n\t\tblk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);\n\t\tq->elevator = NULL;\n\t\tq->nr_requests = q->tag_set->queue_depth;\n\t\treturn 0;\n\t}\n"""
@@ -2027,30 +2077,7 @@ def patch_slab_alloc_free_hotpath(common_root: Path) -> dict[str, object]:
     ensure_contains(slub_c, "void kmem_cache_free(struct kmem_cache *s, void *x)", "feature_porting/slub_free")
     ensure_contains(slub_c, "static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,", "feature_porting/slub_wipe")
 
-    if marker in text:
-        return {
-            **graft_metadata(
-                hard_port_possible=False,
-                semantic_port_used=True,
-                max_function_port_used=False,
-                sidecar_state_used=False,
-                sidecar_state_scope="none",
-                new_interface_used=True,
-                new_interface_scope="file_local_helper",
-            ),
-            "path": str(slub_c),
-            "group": "slab_alloc_free_hotpath",
-            "mode": "already_patched",
-            "public_surface_retained": True,
-            "ported_semantics": [
-                "slub alloc/free hot paths share one next-object helper for freepointer decode and prefetch",
-                "kmem_cache_alloc_bulk() prefetches the next freelist entry on the per-cpu fast path",
-                "kmem_cache_free() and build_detached_freelist() each resolve struct slab once and reuse it through the hot path",
-            ],
-        }
-
-    helper_insert_anchor = """
-/*
+    helper_insert_anchor = """/*
  * Inlined fastpath so that allocation functions (kmalloc, kmem_cache_alloc)
 """
     helper_insert_block = """
@@ -2064,23 +2091,50 @@ static __always_inline void *abk_slab_next_object(struct kmem_cache *s,
 \treturn next_object;
 }
 """
-    text = replace_once(text, helper_insert_anchor, helper_insert_block + helper_insert_anchor, "feature_porting/slub_helpers")
+    if marker not in text:
+        text = replace_once(text, helper_insert_anchor, helper_insert_block + helper_insert_anchor, "feature_porting/slub_helpers")
 
     alloc_fast_old = """\t} else {\n\t\tvoid *next_object = get_freepointer_safe(s, object);\n\n\t\t/*\n\t\t * The cmpxchg will only match if there was no additional\n\t\t * operation and if we are on the right processor.\n"""
     alloc_fast_new = """\t} else {\n\t\tvoid *next_object = abk_slab_next_object(s, object);\n\n\t\t/*\n\t\t * The cmpxchg will only match if there was no additional\n\t\t * operation and if we are on the right processor.\n"""
-    text = replace_once(text, alloc_fast_old, alloc_fast_new, "feature_porting/slub_alloc_fastpath_next")
+    if alloc_fast_new not in text:
+        text = replace_once(text, alloc_fast_old, alloc_fast_new, "feature_porting/slub_alloc_fastpath_next")
 
     alloc_bulk_old = """\t\tc->freelist = get_freepointer(s, object);\n\t\tp[i] = object;\n\t\tmaybe_wipe_obj_freeptr(s, p[i]);\n"""
-    alloc_bulk_new = """\t\tvoid *next_object = abk_slab_next_object(s, object);\n\n\t\tc->freelist = next_object;\n\t\tp[i] = object;\n\t\tmaybe_wipe_obj_freeptr(s, p[i]);\n"""
-    text = replace_once(text, alloc_bulk_old, alloc_bulk_new, "feature_porting/slub_alloc_bulk_prefetch")
+    alloc_bulk_bad = """\t\tvoid *next_object = abk_slab_next_object(s, object);\n\n\t\tc->freelist = next_object;\n\t\tp[i] = object;\n\t\tmaybe_wipe_obj_freeptr(s, p[i]);\n"""
+    alloc_bulk_new = """\t\tnext_object = abk_slab_next_object(s, object);\n\t\tc->freelist = next_object;\n\t\tp[i] = object;\n\t\tmaybe_wipe_obj_freeptr(s, p[i]);\n"""
+    bulk_start, bulk_end = find_c_block(
+        text,
+        "int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,",
+        "feature_porting/slub_alloc_bulk_prefetch",
+    )
+    bulk_scope = text[bulk_start:bulk_end]
+    bulk_original_scope = bulk_scope
+    if "\tvoid *next_object;\n" not in bulk_scope:
+        brace_idx = bulk_scope.find("{")
+        if brace_idx < 0:
+            raise SystemExit("feature_porting/slub_alloc_bulk_prefetch: opening brace missing")
+        tail = bulk_scope[brace_idx + 1 :]
+        if tail.startswith("\n"):
+            tail = tail[1:]
+        bulk_scope = bulk_scope[: brace_idx + 1] + "\n\tvoid *next_object;\n" + tail
+    if alloc_bulk_old in bulk_scope:
+        bulk_scope = bulk_scope.replace(alloc_bulk_old, alloc_bulk_new, 1)
+    elif alloc_bulk_bad in bulk_scope:
+        bulk_scope = bulk_scope.replace(alloc_bulk_bad, alloc_bulk_new, 1)
+    elif alloc_bulk_new not in bulk_scope:
+        raise SystemExit("feature_porting/slub_alloc_bulk_prefetch: expected block missing")
+    if bulk_scope != bulk_original_scope:
+        text = text[:bulk_start] + bulk_scope + text[bulk_end:]
 
     kmem_cache_free_old = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\ttrace_kmem_cache_free(_RET_IP_, x, s);\n\tslab_free(s, virt_to_slab(x), x, NULL, &x, 1, _RET_IP_);\n}\n"""
     kmem_cache_free_new = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\tstruct slab *slab = virt_to_slab(x);\n\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\ttrace_kmem_cache_free(_RET_IP_, x, s);\n\tslab_free(s, slab, x, NULL, &x, 1, _RET_IP_);\n}\n"""
-    text = replace_once(text, kmem_cache_free_old, kmem_cache_free_new, "feature_porting/slub_kmem_cache_free")
+    if kmem_cache_free_new not in text:
+        text = replace_once(text, kmem_cache_free_old, kmem_cache_free_new, "feature_porting/slub_kmem_cache_free")
 
     build_detached_old = """\tstruct folio *folio;\n\tsize_t same;\n\n\tobject = p[--size];\n\tfolio = virt_to_folio(object);\n\tif (!s) {\n\t\t/* Handle kalloc'ed objects */\n\t\tif (unlikely(!folio_test_slab(folio))) {\n\t\t\tfree_large_kmalloc(folio, object);\n\t\t\tdf->slab = NULL;\n\t\t\treturn size;\n\t\t}\n\t\t/* Derive kmem_cache from object */\n\t\tdf->slab = folio_slab(folio);\n\t\tdf->s = df->slab->slab_cache;\n\t} else {\n\t\tdf->slab = folio_slab(folio);\n\t\tdf->s = cache_from_obj(s, object); /* Support for memcg */\n\t}\n"""
     build_detached_new = """\tstruct slab *slab;\n\tsize_t same;\n\n\tobject = p[--size];\n\tslab = virt_to_slab(object);\n\tif (!s) {\n\t\t/* Handle kalloc'ed objects */\n\t\tif (unlikely(!slab)) {\n\t\t\tfree_large_kmalloc(virt_to_folio(object), object);\n\t\t\tdf->slab = NULL;\n\t\t\treturn size;\n\t\t}\n\t\t/* Derive kmem_cache from object */\n\t\tdf->slab = slab;\n\t\tdf->s = slab->slab_cache;\n\t} else {\n\t\tdf->slab = slab;\n\t\tdf->s = cache_from_obj(s, object); /* Support for memcg */\n\t}\n"""
-    text = replace_once(text, build_detached_old, build_detached_new, "feature_porting/slub_build_detached_freelist")
+    if build_detached_new not in text:
+        text = replace_once(text, build_detached_old, build_detached_new, "feature_porting/slub_build_detached_freelist")
 
     write_text(slub_c, text)
     return {
@@ -2095,7 +2149,7 @@ static __always_inline void *abk_slab_next_object(struct kmem_cache *s,
         ),
         "path": str(slub_c),
         "group": "slab_alloc_free_hotpath",
-        "mode": "patched",
+        "mode": "patched" if text != original else "already_patched",
         "public_surface_retained": True,
         "ported_semantics": [
             "slub single-object and bulk allocation now share a next-object helper that also issues freepointer prefetch",
@@ -2702,6 +2756,7 @@ def patch_io_uring_nowait_core(common_root: Path, reference_root: Path) -> dict[
     ensure_contains(filetable_c, "static int io_file_bitmap_get(struct io_ring_ctx *ctx)\n{", "feature_porting/io_uring_core_filetable_c")
     ensure_contains(refs_h, "static inline bool req_ref_put_and_test(struct io_kiocb *req)\n{", "feature_porting/io_uring_core_refs")
     ensure_contains(opdef_c, "const struct io_op_def io_op_defs[] = {", "feature_porting/io_uring_core_opdef")
+    nowait_comment_marker = "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */"
 
     if core_marker not in core_text:
         anchor = "\tif (req->file && !io_req_ffs_set(req))\n"
@@ -2722,7 +2777,7 @@ def patch_io_uring_nowait_core(common_root: Path, reference_root: Path) -> dict[
     else:
         raise SystemExit("feature_porting/io_uring_core_io_wq_free_work: expected old or new io_wq_free_work shape missing")
 
-    if "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */" not in core_text:
+    if nowait_comment_marker not in core_text:
         old = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
         new = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
         if old in core_text:

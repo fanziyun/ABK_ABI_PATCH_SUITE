@@ -340,13 +340,14 @@ static inline void __io_req_set_refcount(struct io_kiocb *req, int nr)
     )
 
 
-def make_fd_alloc_fixture(root: Path, *, with_fdt_words: bool) -> None:
+def make_fd_alloc_fixture(root: Path, *, with_fdt_words: bool, alloc_signature: str | None = None) -> None:
     helper_anchor = "#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds\n\n"
+    alloc_signature = alloc_signature or "static struct fdtable * alloc_fdtable(unsigned int nr)"
 
     write_files(
         root,
         {
-            "fs/file.c": f"""{helper_anchor if with_fdt_words else ""}static struct fdtable * alloc_fdtable(unsigned int nr)
+            "fs/file.c": f"""{helper_anchor if with_fdt_words else ""}{alloc_signature}
 {{
 \tstruct fdtable *fdt;
 \tvoid *data;
@@ -465,6 +466,91 @@ int get_unused_fd_flags(unsigned flags)
 {{
 \treturn __get_unused_fd_flags(flags, rlimit(RLIMIT_NOFILE));
 }}
+""",
+        },
+    )
+
+
+def make_slub_fixture(root: Path) -> None:
+    write_files(
+        root,
+        {
+            "mm/slub.c": """/*
+ * Inlined fastpath so that allocation functions (kmalloc, kmem_cache_alloc)
+ */
+static __always_inline void *slab_alloc_node(struct kmem_cache *s, struct list_lru *lru,
+\t\t\t\t\t     gfp_t gfpflags, int node, unsigned long addr)
+{
+\tvoid *object;
+
+\tif (!object) {
+\t\treturn NULL;
+\t} else {
+\t\tvoid *next_object = get_freepointer_safe(s, object);
+
+\t\t/*
+\t\t * The cmpxchg will only match if there was no additional
+\t\t * operation and if we are on the right processor.
+\t\t */
+\t\treturn next_object;
+\t}
+}
+
+int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+\t\t\t\t void **p)
+{
+\tstruct kmem_cache_cpu *c;
+\tvoid *object;
+\tint i;
+
+\tfor (i = 0; i < size; i++) {
+\t\tobject = p[i];
+\t\tc->freelist = get_freepointer(s, object);
+\t\tp[i] = object;
+\t\tmaybe_wipe_obj_freeptr(s, p[i]);
+\t}
+\treturn 0;
+}
+
+void kmem_cache_free(struct kmem_cache *s, void *x)
+{
+\ts = cache_from_obj(s, x);
+\tif (!s)
+\t\treturn;
+\ttrace_kmem_cache_free(_RET_IP_, x, s);
+\tslab_free(s, virt_to_slab(x), x, NULL, &x, 1, _RET_IP_);
+}
+
+static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,
+\t\t\t\t\t\t   void *obj)
+{
+}
+
+static size_t build_detached_freelist(struct kmem_cache *s, void **p, size_t size,
+\t\t\t\t      struct detached_freelist *df)
+{
+\tvoid *object;
+\tstruct folio *folio;
+\tsize_t same;
+
+\tobject = p[--size];
+\tfolio = virt_to_folio(object);
+\tif (!s) {
+\t\t/* Handle kalloc'ed objects */
+\t\tif (unlikely(!folio_test_slab(folio))) {
+\t\t\tfree_large_kmalloc(folio, object);
+\t\t\tdf->slab = NULL;
+\t\t\treturn size;
+\t\t}
+\t\t/* Derive kmem_cache from object */
+\t\tdf->slab = folio_slab(folio);
+\t\tdf->s = df->slab->slab_cache;
+\t} else {
+\t\tdf->slab = folio_slab(folio);
+\t\tdf->s = cache_from_obj(s, object); /* Support for memcg */
+\t}
+\treturn same;
+}
 """,
         },
     )
@@ -822,6 +908,22 @@ class FeaturePortingRegressionTest(unittest.TestCase):
             blk_mq_path.read_text(),
         )
 
+    def test_blk_mq_async_depth_uses_explicit_resize_type(self) -> None:
+        make_blk_mq_fixture(self.root)
+
+        result = FEATURE_PORTING.patch_blk_mq_async_depth(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        blk_mq_text = (self.root / "block/blk-mq.c").read_text()
+        self.assertIn("unsigned long new_async_depth;", blk_mq_text)
+        self.assertIn("new_async_depth = q->async_depth * nr / q->nr_requests;", blk_mq_text)
+        self.assertIn("q->async_depth = min_t(unsigned long, new_async_depth, UINT_MAX);", blk_mq_text)
+        self.assertNotIn("max(q->async_depth * nr / q->nr_requests, 1U)", blk_mq_text)
+
+        FEATURE_PORTING.patch_blk_mq_async_depth(self.root)
+        rerun_text = (self.root / "block/blk-mq.c").read_text()
+        self.assertEqual(rerun_text.count("new_async_depth = q->async_depth * nr / q->nr_requests;"), 1)
+
     def test_io_uring_nowait_core_accepts_61_25_comment_drift(self) -> None:
         make_io_uring_fixture(self.root, exact_comment_shape=False)
 
@@ -832,6 +934,31 @@ class FeaturePortingRegressionTest(unittest.TestCase):
         refs_text = (self.root / "io_uring/refs.h").read_text()
         self.assertIn("only keep NOWAIT final when the request explicitly requested it", core_text)
         self.assertIn("req_ref_put_and_test_atomic", refs_text)
+        self.assert_count(
+            core_text,
+            "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */",
+        )
+
+        rerun = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_io_uring_nowait_core_keeps_partial_comment_marker_idempotent(self) -> None:
+        make_io_uring_fixture(self.root, exact_comment_shape=False)
+
+        io_uring_path = self.root / "io_uring/io_uring.c"
+        partial = io_uring_path.read_text().replace(
+            "\t\tif (req->flags & REQ_F_NOWAIT)\n",
+            "\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n"
+            "\t\tif (req->flags & REQ_F_NOWAIT)\n",
+            1,
+        )
+        io_uring_path.write_text(partial)
+
+        result = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        core_text = io_uring_path.read_text()
+        self.assertIn("io_uring NOWAIT core issue path graft", core_text)
         self.assert_count(
             core_text,
             "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */",
@@ -877,6 +1004,47 @@ class FeaturePortingRegressionTest(unittest.TestCase):
         self.assertIn("#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds", text)
         self.assertIn("abk_fdtable_slots_wanted", text)
         self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+    def test_fd_alloc_hotpath_accepts_drifted_alloc_fdtable_signature(self) -> None:
+        make_fd_alloc_fixture(
+            self.root,
+            with_fdt_words=False,
+            alloc_signature="""static struct fdtable *
+alloc_fdtable(unsigned int nr)""",
+        )
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("unsigned int slots_wanted;", text)
+        self.assertIn("slots_wanted = abk_fdtable_slots_wanted(nr);", text)
+        self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_slab_alloc_free_hotpath_keeps_c89_declarations(self) -> None:
+        make_slub_fixture(self.root)
+
+        result = FEATURE_PORTING.patch_slab_alloc_free_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "mm/slub.c").read_text()
+        bulk_start = text.index("int kmem_cache_alloc_bulk(")
+        bulk_end = text.index("void kmem_cache_free(", bulk_start)
+        bulk_text = text[bulk_start:bulk_end]
+        decl_idx = text.index("\tvoid *next_object;\n", bulk_start)
+        loop_idx = text.index("\tfor (i = 0; i < size; i++) {\n", bulk_start)
+        self.assertIn("abk_slab_next_object", text)
+        self.assertIn("\t\tnext_object = abk_slab_next_object(s, object);\n", bulk_text)
+        self.assertNotIn("\t\tvoid *next_object = abk_slab_next_object(s, object);\n", bulk_text)
+        self.assertLess(decl_idx, loop_idx)
+        self.assert_count(text, "/* ABK feature_porting: slab alloc/free hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_slab_alloc_free_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
 
     def test_close_range_hotpath_accepts_61_141_pick_file_shape(self) -> None:
         make_close_range_fixture(self.root, raw_dereference=True)
