@@ -271,6 +271,496 @@ static void kyber_depth_updated_impl(struct blk_mq_hw_ctx *hctx)
     )
 
 
+def make_io_uring_fixture(root: Path, *, exact_comment_shape: bool) -> None:
+    if exact_comment_shape:
+        nowait_block = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
+    else:
+        nowait_block = """\t\t/* 6.1.25 keeps NOWAIT final here, but not the newer comment block. */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
+
+    write_files(
+        root,
+        {
+            "io_uring/io_uring.c": f"""static void io_prep_async_work(struct io_kiocb *req)
+{{
+\tif (req->file && !io_req_ffs_set(req))
+\t\treturn;
+}}
+
+struct io_wq_work *io_wq_free_work(struct io_wq_work *work)
+{{
+\tstruct io_kiocb *req = container_of(work, struct io_kiocb, work);
+
+\treq = io_put_req_find_next(req);
+\treturn req ? &req->work : NULL;
+}}
+
+void io_wq_submit_work(struct io_wq_work *work)
+{{
+\tstruct io_kiocb *req = container_of(work, struct io_kiocb, work);
+
+\twhile (1) {{
+{nowait_block}\t}}
+}}
+
+static void io_queue_async(struct io_kiocb *req, int ret)
+\t__must_hold(&req->ctx->uring_lock)
+{{
+\tif (ret)
+\t\treturn;
+}}
+""",
+            "io_uring/filetable.c": """static int io_file_bitmap_get(struct io_ring_ctx *ctx)
+{
+\tstruct io_file_table *table = &ctx->file_table;
+
+\tif (!table->bitmap)
+\t\treturn -ENFILE;
+
+\tdo {
+\t\treturn 0;
+\t} while (0);
+}
+""",
+            "io_uring/filetable.h": """unsigned int io_file_get_flags(struct file *file);
+#define FFS_NOWAIT\t\t0x1UL
+""",
+            "io_uring/refs.h": """static inline bool req_ref_put_and_test(struct io_kiocb *req)
+{
+\treturn false;
+}
+
+static inline void __io_req_set_refcount(struct io_kiocb *req, int nr)
+{
+}
+""",
+            "io_uring/opdef.c": """const struct io_op_def io_op_defs[] = {
+};
+""",
+        },
+    )
+
+
+def make_fd_alloc_fixture(root: Path, *, with_fdt_words: bool) -> None:
+    helper_anchor = "#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds\n\n"
+
+    write_files(
+        root,
+        {
+            "fs/file.c": f"""{helper_anchor if with_fdt_words else ""}static struct fdtable * alloc_fdtable(unsigned int nr)
+{{
+\tstruct fdtable *fdt;
+\tvoid *data;
+
+\t/*
+\t * Figure out how many fds we actually want to support in this fdtable.
+\t * Allocation steps are keyed to the size of the fdarray, since it
+\t * grows far faster than any of the other dynamic data. We try to fit
+\t * the fdarray into comfortable page-tuned chunks: starting at 1024B
+\t * and growing in powers of two from there on.
+\t */
+\tnr /= (1024 / sizeof(struct file *));
+\tnr = roundup_pow_of_two(nr + 1);
+\tnr *= (1024 / sizeof(struct file *));
+\tnr = ALIGN(nr, BITS_PER_LONG);
+\t/*
+\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open
+\t * had been set lower between the check in expand_files() and here.  Deal
+\t * with that in caller, it's cheaper that way.
+\t *
+\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise
+\t * bitmaps handling below becomes unpleasant, to put it mildly...
+\t */
+\tif (unlikely(nr > sysctl_nr_open))
+\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;
+
+\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);
+\tif (!fdt)
+\t\tgoto out;
+\tfdt->max_fds = nr;
+\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);
+\tif (!data)
+\t\tgoto out_fdt;
+\tfdt->fd = data;
+
+\tdata = kvmalloc(max_t(size_t,
+\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),
+\t\t\t\t GFP_KERNEL_ACCOUNT);
+\tif (!data)
+\t\tgoto out_arr;
+\tfdt->open_fds = data;
+\tdata += nr / BITS_PER_BYTE;
+\tfdt->close_on_exec = data;
+\tdata += nr / BITS_PER_BYTE;
+\tfdt->full_fds_bits = data;
+
+\treturn fdt;
+
+out_arr:
+\tkvfree(fdt->fd);
+out_fdt:
+\tkfree(fdt);
+out:
+\treturn NULL;
+}}
+
+static int expand_fdtable(struct files_struct *files, unsigned int nr)
+{{
+\treturn 0;
+}}
+
+static int expand_files(struct files_struct *files, unsigned int nr)
+{{
+\tint expanded = 0;
+\tstruct fdtable *fdt;
+
+repeat:
+\tfdt = files_fdtable(files);
+
+\t/* Do we need to expand? */
+\tif (nr < fdt->max_fds)
+\t\treturn expanded;
+
+\t/* Can we expand? */
+\tif (nr >= sysctl_nr_open)
+\t\treturn -EMFILE;
+
+\treturn expanded;
+}}
+
+static int alloc_fd(struct files_struct *files, unsigned start, unsigned end, unsigned flags)
+{{
+\tstruct fdtable *fdt = files_fdtable(files);
+\tunsigned int fd = start;
+\tint error;
+
+repeat:
+\tif (fd < fdt->max_fds)
+\t\tfd = find_next_fd(fdt, fd);
+
+\t/*
+\t * N.B. For clone tasks sharing a files structure, this test
+\t * will limit the total number of files that can be opened.
+\t */
+\terror = -EMFILE;
+\tif (fd >= end)
+\t\tgoto out;
+
+\terror = expand_files(files, fd);
+\tif (error < 0)
+\t\tgoto out;
+
+\t/*
+\t * If we needed to expand the fs array we
+\t * might have blocked - try again.
+\t */
+\tif (error)
+\t\tgoto repeat;
+
+\treturn fd;
+out:
+\treturn error;
+}}
+
+int get_unused_fd_flags(unsigned flags)
+{{
+\treturn __get_unused_fd_flags(flags, rlimit(RLIMIT_NOFILE));
+}}
+""",
+        },
+    )
+
+
+def make_close_range_fixture(root: Path, *, raw_dereference: bool) -> None:
+    file_load = "file = rcu_dereference_raw(fdt->fd[fd]);" if raw_dereference else "file = fdt->fd[fd];"
+
+    write_files(
+        root,
+        {
+            "fs/file.c": f"""static struct file *pick_file(struct files_struct *files, unsigned fd)
+{{
+\tstruct fdtable *fdt = files_fdtable(files);
+\tstruct file *file;
+
+\tif (fd >= fdt->max_fds)
+\t\treturn NULL;
+
+\tfd = array_index_nospec(fd, fdt->max_fds);
+\t{file_load}
+\tif (file) {{
+\t\trcu_assign_pointer(fdt->fd[fd], NULL);
+\t\t__put_unused_fd(files, fd);
+\t}}
+\treturn file;
+}}
+
+static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
+\t\t\t\t unsigned int max_fd)
+{{
+\tunsigned n;
+
+\trcu_read_lock();
+\tn = last_fd(files_fdtable(cur_fds));
+\trcu_read_unlock();
+\tmax_fd = min(max_fd, n);
+
+\twhile (fd <= max_fd) {{
+\t\tstruct file *file;
+
+\t\tspin_lock(&cur_fds->file_lock);
+\t\tfile = pick_file(cur_fds, fd++);
+\t\tspin_unlock(&cur_fds->file_lock);
+
+\t\tif (file) {{
+\t\t\t/* found a valid file to close */
+\t\t\tfilp_close(file, cur_fds);
+\t\t\tcond_resched();
+\t\t}}
+\t}}
+}}
+
+int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
+{{
+\treturn 0;
+}}
+""",
+        },
+    )
+
+
+def make_fair_fixture(root: Path, *, drifted_reweight: bool) -> None:
+    if drifted_reweight:
+        reweight_fn = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+\t\t\t    unsigned long weight)
+{
+\tif (se->on_rq) {
+\t\t/* commit outstanding execution time */
+\t\tif (cfs_rq->curr == se)
+\t\t\tupdate_curr(cfs_rq);
+
+\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);
+\t}
+\tdequeue_load_avg(cfs_rq, se);
+
+\tupdate_load_set(&se->load, weight);
+
+#ifdef CONFIG_SMP
+\tdo {
+\t\tu32 divider = get_pelt_divider(&se->avg);
+
+\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);
+\t} while (0);
+#endif
+
+\tenqueue_load_avg(cfs_rq, se);
+\tif (se->on_rq)
+\t\tupdate_load_add(&cfs_rq->load, se->load.weight);
+
+}
+"""
+    else:
+        reweight_fn = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+\t\t\t    unsigned long weight)
+{
+\tif (se->on_rq) {
+\t\t/* commit outstanding execution time */
+\t\tif (cfs_rq->curr == se)
+\t\t\tupdate_curr(cfs_rq);
+\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);
+\t}
+\tdequeue_load_avg(cfs_rq, se);
+
+\tupdate_load_set(&se->load, weight);
+
+#ifdef CONFIG_SMP
+\tdo {
+\t\tu32 divider = get_pelt_divider(&se->avg);
+
+\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);
+\t} while (0);
+#endif
+
+\tenqueue_load_avg(cfs_rq, se);
+\tif (se->on_rq)
+\t\tupdate_load_add(&cfs_rq->load, se->load.weight);
+
+}
+"""
+
+    write_files(
+        root,
+        {
+            "kernel/sched/fair.c": f"""static inline bool entity_before(struct sched_entity *a,
+\t\t\t\t      struct sched_entity *b)
+{{
+\treturn false;
+}}
+
+static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{{
+\treturn calc_delta_fair(sched_slice(cfs_rq, se), se);
+}}
+
+#ifdef CONFIG_SMP
+static inline void
+enqueue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {{ }}
+static inline void
+dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {{ }}
+#endif
+
+{reweight_fn}
+static struct sched_entity *__pick_next_entity(struct sched_entity *se)
+{{
+\treturn se;
+}}
+
+static void
+place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+{{
+\tu64 vruntime = cfs_rq->min_vruntime;
+
+\tif (entity_is_long_sleeper(se))
+\t\tse->vruntime = vruntime;
+\telse
+\t\tse->vruntime = max_vruntime(se->vruntime, vruntime);
+}}
+
+enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+{{
+\tstruct sched_entity *curr = cfs_rq->curr;
+
+\tif (flags & ENQUEUE_WAKEUP)
+\t\tplace_entity(cfs_rq, se, 0);
+\t/* Entity has migrated, no longer consider this task hot */
+\tif (flags & ENQUEUE_MIGRATED)
+\t\tse->exec_start = 0;
+
+\tcheck_schedstat_required();
+\tupdate_stats_enqueue_fair(cfs_rq, se, flags);
+\tcheck_spread(cfs_rq, se);
+\tif (!curr)
+\t\t__enqueue_entity(cfs_rq, se);
+\tse->on_rq = 1;
+}}
+
+check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{{
+\tstruct sched_entity *se;
+\ts64 delta;
+\tu64 ideal_runtime = 0;
+
+\tse = __pick_first_entity(cfs_rq);
+\tdelta = curr->vruntime - se->vruntime;
+
+\tif (delta < 0)
+\t\treturn;
+
+\tif (delta > ideal_runtime)
+\t\tresched_curr(rq_of(cfs_rq));
+}}
+
+void set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{{
+\tif (se->on_rq) {{
+\t\tupdate_stats_wait_end_fair(cfs_rq, se);
+\t\t__dequeue_entity(cfs_rq, se);
+\t\tupdate_load_avg(cfs_rq, se, UPDATE_TG);
+\t}}
+}}
+
+static struct sched_entity *
+pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{{
+\tstruct sched_entity *left = __pick_first_entity(cfs_rq);
+\tstruct sched_entity *se = NULL;
+
+\ttrace_android_rvh_pick_next_entity(cfs_rq, curr, &se);
+\tif (se)
+\t\tgoto done;
+
+\t/*
+\t * If curr is set we have to see if its left of the leftmost entity
+\t * still in the tree, provided there was anything in the tree at all.
+\t */
+\tif (!left || (curr && entity_before(curr, left)))
+\t\tleft = curr;
+
+\tse = left; /* ideally we run the leftmost entity */
+
+\t/*
+\t * Avoid running the skip buddy, if running something else can
+\t * be done without getting too unfair.
+\t */
+\tif (cfs_rq->skip && cfs_rq->skip == se) {{
+\t\tstruct sched_entity *second;
+
+\t\tif (se == curr) {{
+\t\t\tsecond = __pick_first_entity(cfs_rq);
+\t\t}} else {{
+\t\t\tsecond = __pick_next_entity(se);
+\t\t\tif (!second || (curr && entity_before(curr, second)))
+\t\t\t\tsecond = curr;
+\t\t}}
+
+\t\tif (second && wakeup_preempt_entity(second, left) < 1)
+\t\t\tse = second;
+\t}}
+
+\tif (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, left) < 1) {{
+\t\t/*
+\t\t * Someone really wants this to run. If it's not unfair, run it.
+\t\t */
+\t\tse = cfs_rq->next;
+\t}} else if (cfs_rq->last && wakeup_preempt_entity(cfs_rq->last, left) < 1) {{
+\t\t/*
+\t\t * Prefer last buddy, try to return the CPU to a preempted task.
+\t\t */
+\t\tse = cfs_rq->last;
+\t}}
+
+done:
+\treturn se;
+}}
+
+static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
+{{
+\tif (prev->on_rq) {{
+\t\tupdate_stats_wait_start_fair(cfs_rq, prev);
+\t\t/* Put 'current' back into the tree. */
+\t\t__enqueue_entity(cfs_rq, prev);
+\t\t/* in !on_rq case, update occurred at dequeue */
+\t\tupdate_load_avg(cfs_rq, prev, 0);
+\t}}
+}}
+
+static void
+dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+{{
+\tint action = UPDATE_TG;
+
+\tupdate_stats_dequeue_fair(cfs_rq, se, flags);
+
+\tclear_buddies(cfs_rq, se);
+
+\tif (se != cfs_rq->curr)
+\t\t__dequeue_entity(cfs_rq, se);
+\tse->on_rq = 0;
+\taccount_entity_dequeue(cfs_rq, se);
+
+\tif (!(flags & DEQUEUE_SLEEP))
+\t\tse->vruntime -= cfs_rq->min_vruntime;
+}}
+
+entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+{{
+\tif (cfs_rq->nr_running > 1)
+\t\tcheck_preempt_tick(cfs_rq, curr);
+\ttrace_android_rvh_entity_tick(cfs_rq, curr);
+}}
+""",
+        },
+    )
+
+
 class FeaturePortingRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -278,6 +768,9 @@ class FeaturePortingRegressionTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
+
+    def assert_count(self, text: str, needle: str, expected: int = 1) -> None:
+        self.assertEqual(text.count(needle), expected, needle)
 
     def test_pidfd_preparation_accepts_prepare_based_fork_shape(self) -> None:
         make_pidfd_fixture(self.root)
@@ -328,6 +821,101 @@ class FeaturePortingRegressionTest(unittest.TestCase):
             "void (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;",
             blk_mq_path.read_text(),
         )
+
+    def test_io_uring_nowait_core_accepts_61_25_comment_drift(self) -> None:
+        make_io_uring_fixture(self.root, exact_comment_shape=False)
+
+        result = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        core_text = (self.root / "io_uring/io_uring.c").read_text()
+        refs_text = (self.root / "io_uring/refs.h").read_text()
+        self.assertIn("only keep NOWAIT final when the request explicitly requested it", core_text)
+        self.assertIn("req_ref_put_and_test_atomic", refs_text)
+        self.assert_count(
+            core_text,
+            "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */",
+        )
+
+        rerun = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_io_uring_nowait_core_keeps_existing_comment_shape(self) -> None:
+        make_io_uring_fixture(self.root, exact_comment_shape=True)
+
+        result = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        core_text = (self.root / "io_uring/io_uring.c").read_text()
+        self.assertIn("io_uring NOWAIT core issue path graft", core_text)
+        self.assertCountEqual(
+            [line for line in core_text.splitlines() if "only keep NOWAIT final" in line],
+            ["\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */"],
+        )
+
+    def test_fd_alloc_hotpath_accepts_61_57_helperless_shape(self) -> None:
+        make_fd_alloc_fixture(self.root, with_fdt_words=False)
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("abk_fdtable_slots_wanted", text)
+        self.assertIn("abk_expand_files_needed", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_fd_alloc_hotpath_keeps_macro_anchor_shape(self) -> None:
+        make_fd_alloc_fixture(self.root, with_fdt_words=True)
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds", text)
+        self.assertIn("abk_fdtable_slots_wanted", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+    def test_close_range_hotpath_accepts_61_141_pick_file_shape(self) -> None:
+        make_close_range_fixture(self.root, raw_dereference=True)
+
+        result = FEATURE_PORTING.patch_close_range_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("if (!fd_is_open(fd, fdt))", text)
+        self.assertIn("abk_close_range_limit", text)
+        self.assertIn("abk_pick_file_for_close", text)
+        self.assert_count(text, "/* ABK feature_porting: close_range() bitmap hotpath graft. */")
+
+        rerun = FEATURE_PORTING.patch_close_range_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_sched_pick_logic_accepts_drifted_reweight_shape(self) -> None:
+        make_fair_fixture(self.root, drifted_reweight=True)
+
+        result = FEATURE_PORTING.patch_sched_pick_logic(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        phase3 = FEATURE_PORTING.patch_sched_runtime_state_phase3(self.root)
+        self.assertEqual(phase3["mode"], "patched")
+
+        fair_text = (self.root / "kernel/sched/fair.c").read_text()
+        self.assertIn("bool queued = se->on_rq;", fair_text)
+        self.assertIn("abk_eevdf_scale_rel_deadline", fair_text)
+        self.assertIn("place_entity(cfs_rq, se, 0);", fair_text)
+        self.assert_count(fair_text, "/* ABK feature_porting: scan-based EEVDF runtime-state graft. */")
+        self.assert_count(
+            fair_text,
+            "/* ABK feature_porting: phase-3 preserve lag/deadline across both current and queued reweight paths. */",
+        )
+
+        rerun = FEATURE_PORTING.patch_sched_pick_logic(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+        rerun_phase3 = FEATURE_PORTING.patch_sched_runtime_state_phase3(self.root)
+        self.assertEqual(rerun_phase3["mode"], "already_patched")
 
 
 if __name__ == "__main__":

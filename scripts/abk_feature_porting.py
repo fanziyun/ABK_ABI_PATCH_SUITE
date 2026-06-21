@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -173,6 +174,56 @@ def replace_scope(text: str, start: str, end: str, new: str, label: str) -> str:
     return text[:start_idx] + new + text[end_idx:]
 
 
+def find_c_block(text: str, start: str, label: str) -> tuple[int, int]:
+    start_idx = text.find(start)
+    if start_idx < 0:
+        raise SystemExit(f"{label}: start anchor missing")
+
+    brace_idx = text.find("{", start_idx)
+    if brace_idx < 0:
+        raise SystemExit(f"{label}: opening brace missing")
+
+    depth = 0
+    idx = brace_idx
+    while idx < len(text):
+        if text.startswith("/*", idx):
+            end = text.find("*/", idx + 2)
+            if end < 0:
+                raise SystemExit(f"{label}: unterminated block comment")
+            idx = end + 2
+            continue
+        if text.startswith("//", idx):
+            end = text.find("\n", idx + 2)
+            if end < 0:
+                return start_idx, len(text)
+            idx = end + 1
+            continue
+
+        char = text[idx]
+        if char in ("'", '"'):
+            quote = char
+            idx += 1
+            while idx < len(text):
+                if text[idx] == "\\":
+                    idx += 2
+                    continue
+                if text[idx] == quote:
+                    idx += 1
+                    break
+                idx += 1
+            continue
+
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return start_idx, idx + 1
+        idx += 1
+
+    raise SystemExit(f"{label}: closing brace missing")
+
+
 def bool_status(value: bool) -> str:
     return "present" if value else "missing"
 
@@ -261,6 +312,79 @@ def patch_sched_entity_fields(common_root: Path) -> dict[str, object]:
             "slice": "ANDROID_KABI_USE(4, u64 slice);",
         },
     }
+
+
+def _patch_fair_reweight_compat(text: str, label: str) -> str:
+    signature = "static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,"
+    start_idx, end_idx = find_c_block(text, signature, label)
+    scope = text[start_idx:end_idx]
+
+    if "bool queued = se->on_rq;" in scope:
+        return text
+
+    if "bool curr = cfs_rq->curr == se;\n" not in scope:
+        decl_anchor = "{\n"
+        if decl_anchor not in scope:
+            raise SystemExit(f"{label}: expected function opening missing")
+        scope = scope.replace(
+            decl_anchor,
+            "{\n"
+            "\tbool curr = cfs_rq->curr == se;\n"
+            "\tbool queued = se->on_rq;\n"
+            "\tunsigned long old_weight = max_t(unsigned long, se->load.weight, 1UL);\n"
+            "\tunsigned long new_weight = max_t(unsigned long, weight, 1UL);\n\n",
+            1,
+        )
+
+    scoped_patterns = (
+        (
+            re.compile(
+                r"\tif \(se->on_rq\) \{\n.*?\t\tupdate_load_sub\(&cfs_rq->load, se->load.weight\);\n\t\}\n",
+                re.DOTALL,
+            ),
+            "\tif (queued) {\n"
+            "\t\t/* commit outstanding execution time before preserving lag/deadline */\n"
+            "\t\tif (curr)\n"
+            "\t\t\tupdate_curr(cfs_rq);\n"
+            "\t\tabk_eevdf_update_lag(cfs_rq, se);\n"
+            "\t\tabk_eevdf_store_rel_deadline(se);\n"
+            "\t\tif (!curr)\n"
+            "\t\t\t__dequeue_entity(cfs_rq, se);\n"
+            "\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);\n"
+            "\t}\n",
+            "queued pre-update branch",
+        ),
+        (
+            re.compile(
+                r"\tdequeue_load_avg\(cfs_rq, se\);\n(?:\n)+\tupdate_load_set\(&se->load, weight\);\n"
+            ),
+            "\tdequeue_load_avg(cfs_rq, se);\n\n"
+            "\tse->vlag = div_s64(se->vlag * (s64)old_weight, new_weight);\n"
+            "\tabk_eevdf_scale_rel_deadline(se, old_weight, new_weight);\n"
+            "\tupdate_load_set(&se->load, weight);\n",
+            "lag/deadline scaling block",
+        ),
+        (
+            re.compile(
+                r"\tenqueue_load_avg\(cfs_rq, se\);\n\tif \(se->on_rq\)\n\t\tupdate_load_add\(&cfs_rq->load, se->load.weight\);\n"
+            ),
+            "\tenqueue_load_avg(cfs_rq, se);\n"
+            "\tif (queued) {\n"
+            "\t\tplace_entity(cfs_rq, se, 0);\n"
+            "\t\tupdate_load_add(&cfs_rq->load, se->load.weight);\n"
+            "\t\tif (!curr)\n"
+            "\t\t\t__enqueue_entity(cfs_rq, se);\n"
+            "\t}\n",
+            "queued restore block",
+        ),
+    )
+
+    for pattern, replacement, desc in scoped_patterns:
+        scope, count = pattern.subn(replacement, scope, count=1)
+        if count != 1:
+            raise SystemExit(f"{label}: expected {desc} missing")
+
+    return text[:start_idx] + scope + text[end_idx:]
 
 
 def patch_sched_pick_logic(common_root: Path) -> dict[str, object]:
@@ -618,7 +742,10 @@ static struct sched_entity *abk_pick_eevdf(struct cfs_rq *cfs_rq,
 
     reweight_old = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,\n\t\t\t    unsigned long weight)\n{\n\tif (se->on_rq) {\n\t\t/* commit outstanding execution time */\n\t\tif (cfs_rq->curr == se)\n\t\t\tupdate_curr(cfs_rq);\n\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);\n\t}\n\tdequeue_load_avg(cfs_rq, se);\n\n\tupdate_load_set(&se->load, weight);\n\n#ifdef CONFIG_SMP\n\tdo {\n\t\tu32 divider = get_pelt_divider(&se->avg);\n\n\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);\n\t} while (0);\n#endif\n\n\tenqueue_load_avg(cfs_rq, se);\n\tif (se->on_rq)\n\t\tupdate_load_add(&cfs_rq->load, se->load.weight);\n\n}\n"""
     reweight_new = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,\n\t\t\t    unsigned long weight)\n{\n\tbool curr = cfs_rq->curr == se;\n\tbool queued = se->on_rq;\n\tunsigned long old_weight = max_t(unsigned long, se->load.weight, 1UL);\n\tunsigned long new_weight = max_t(unsigned long, weight, 1UL);\n\n\tif (queued) {\n\t\t/* commit outstanding execution time before preserving lag/deadline */\n\t\tif (curr)\n\t\t\tupdate_curr(cfs_rq);\n\t\tabk_eevdf_update_lag(cfs_rq, se);\n\t\tabk_eevdf_store_rel_deadline(se);\n\t\tif (!curr)\n\t\t\t__dequeue_entity(cfs_rq, se);\n\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);\n\t}\n\tdequeue_load_avg(cfs_rq, se);\n\n\tse->vlag = div_s64(se->vlag * (s64)old_weight, new_weight);\n\tabk_eevdf_scale_rel_deadline(se, old_weight, new_weight);\n\tupdate_load_set(&se->load, weight);\n\n#ifdef CONFIG_SMP\n\tdo {\n\t\tu32 divider = get_pelt_divider(&se->avg);\n\n\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);\n\t} while (0);\n#endif\n\n\tenqueue_load_avg(cfs_rq, se);\n\tif (queued) {\n\t\tplace_entity(cfs_rq, se, 0);\n\t\tupdate_load_add(&cfs_rq->load, se->load.weight);\n\t\tif (!curr)\n\t\t\t__enqueue_entity(cfs_rq, se);\n\t}\n\n}\n"""
-    text = replace_once(text, reweight_old, reweight_new, "feature_porting/fair_reweight")
+    if reweight_old in text:
+        text = replace_once(text, reweight_old, reweight_new, "feature_porting/fair_reweight")
+    elif reweight_new not in text:
+        text = _patch_fair_reweight_compat(text, "feature_porting/fair_reweight")
 
     enqueue_old = """\tif (flags & ENQUEUE_WAKEUP)\n\t\tplace_entity(cfs_rq, se, 0);\n"""
     enqueue_new = """\tif ((flags & ENQUEUE_WAKEUP) || abk_eevdf_has_rel_deadline(se) || se->vlag)\n\t\tplace_entity(cfs_rq, se, 0);\n"""
@@ -921,8 +1048,22 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     ensure_contains(file_c, "int get_unused_fd_flags(unsigned flags)", "feature_porting/fd_alloc")
 
     helper_anchor = """#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds\n"""
-    helper_block = helper_anchor + """\n/* ABK feature_porting: fd allocation hotpath helper graft. */\nstatic inline unsigned int abk_fdtable_slots_wanted(unsigned int nr)\n{\n\tunsigned int slots_wanted;\n\n\tslots_wanted = nr + 1;\n\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)\n\t\treturn 256;\n\treturn roundup_pow_of_two(slots_wanted);\n}\n\nstatic inline bool abk_expand_files_needed(const struct fdtable *fdt, unsigned int nr)\n{\n\treturn nr >= fdt->max_fds;\n}\n"""
-    text = replace_once(text, helper_anchor, helper_block, "feature_porting/fd_alloc_helpers")
+    helper_block = """/* ABK feature_porting: fd allocation hotpath helper graft. */\nstatic inline unsigned int abk_fdtable_slots_wanted(unsigned int nr)\n{\n\tunsigned int slots_wanted;\n\n\tslots_wanted = nr + 1;\n\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)\n\t\treturn 256;\n\treturn roundup_pow_of_two(slots_wanted);\n}\n\nstatic inline bool abk_expand_files_needed(const struct fdtable *fdt, unsigned int nr)\n{\n\treturn nr >= fdt->max_fds;\n}\n"""
+    if helper_anchor in text:
+        text = replace_once(text, helper_anchor, helper_anchor + "\n" + helper_block, "feature_porting/fd_alloc_helpers")
+    else:
+        helper_match = re.search(r"^#define fdt_words\(fdt\).*\n", text, re.MULTILINE)
+        if helper_match:
+            anchor = helper_match.group(0)
+            text = replace_once(text, anchor, anchor + "\n" + helper_block, "feature_porting/fd_alloc_helpers")
+        else:
+            alloc_anchor = "static struct fdtable * alloc_fdtable(unsigned int nr)\n{"
+            text = replace_once(
+                text,
+                alloc_anchor,
+                helper_block + "\n" + alloc_anchor,
+                "feature_porting/fd_alloc_helpers",
+            )
 
     alloc_old = """static struct fdtable * alloc_fdtable(unsigned int nr)\n{\n\tstruct fdtable *fdt;\n\tvoid *data;\n\n\t/*\n\t * Figure out how many fds we actually want to support in this fdtable.\n\t * Allocation steps are keyed to the size of the fdarray, since it\n\t * grows far faster than any of the other dynamic data. We try to fit\n\t * the fdarray into comfortable page-tuned chunks: starting at 1024B\n\t * and growing in powers of two from there on.\n\t */\n\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n\t/*\n\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open\n\t * had been set lower between the check in expand_files() and here.  Deal\n\t * with that in caller, it's cheaper that way.\n\t *\n\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise\n\t * bitmaps handling below becomes unpleasant, to put it mildly...\n\t */\n\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n\n\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);\n\tif (!fdt)\n\t\tgoto out;\n\tfdt->max_fds = nr;\n\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_fdt;\n\tfdt->fd = data;\n\n\tdata = kvmalloc(max_t(size_t,\n\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),\n\t\t\t\t GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_arr;\n\tfdt->open_fds = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->close_on_exec = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->full_fds_bits = data;\n\n\treturn fdt;\n\nout_arr:\n\tkvfree(fdt->fd);\nout_fdt:\n\tkfree(fdt);\nout:\n\treturn NULL;\n}\n"""
     alloc_new = """static struct fdtable * alloc_fdtable(unsigned int nr)\n{\n\tstruct fdtable *fdt;\n\tunsigned int slots_wanted = abk_fdtable_slots_wanted(nr);\n\tvoid *data;\n\n\t/*\n\t * Keep the legacy file-local interface shape, but derive capacity from\n\t * the requested slot count before dropping into the allocator.\n\t */\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n\t/*\n\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open\n\t * had been set lower between the check in expand_files() and here.  Deal\n\t * with that in caller, it's cheaper that way.\n\t *\n\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise\n\t * bitmaps handling below becomes unpleasant, to put it mildly...\n\t */\n\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))\n\t\treturn NULL;\n\n\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);\n\tif (!fdt)\n\t\tgoto out;\n\tfdt->max_fds = nr;\n\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_fdt;\n\tfdt->fd = data;\n\n\tdata = kvmalloc(max_t(size_t,\n\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),\n\t\t\t\t GFP_KERNEL_ACCOUNT);\n\tif (!data)\n\t\tgoto out_arr;\n\tfdt->open_fds = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->close_on_exec = data;\n\tdata += nr / BITS_PER_BYTE;\n\tfdt->full_fds_bits = data;\n\n\treturn fdt;\n\nout_arr:\n\tkvfree(fdt->fd);\nout_fdt:\n\tkfree(fdt);\nout:\n\treturn NULL;\n}\n"""
@@ -1003,7 +1144,24 @@ def patch_close_range_hotpath(common_root: Path) -> dict[str, object]:
 
     pick_old = """static struct file *pick_file(struct files_struct *files, unsigned fd)\n{\n\tstruct fdtable *fdt = files_fdtable(files);\n\tstruct file *file;\n\n\tif (fd >= fdt->max_fds)\n\t\treturn NULL;\n\n\tfd = array_index_nospec(fd, fdt->max_fds);\n\tfile = fdt->fd[fd];\n\tif (file) {\n\t\trcu_assign_pointer(fdt->fd[fd], NULL);\n\t\t__put_unused_fd(files, fd);\n\t}\n\treturn file;\n}\n"""
     pick_new = """/* ABK feature_porting: close_range() bitmap hotpath graft. */\nstatic struct file *pick_file(struct files_struct *files, unsigned fd)\n{\n\tstruct fdtable *fdt = files_fdtable(files);\n\tstruct file *file;\n\n\tif (fd >= fdt->max_fds)\n\t\treturn NULL;\n\tif (!fd_is_open(fd, fdt))\n\t\treturn NULL;\n\n\tfd = array_index_nospec(fd, fdt->max_fds);\n\tfile = fdt->fd[fd];\n\tif (file) {\n\t\trcu_assign_pointer(fdt->fd[fd], NULL);\n\t\t__put_unused_fd(files, fd);\n\t}\n\treturn file;\n}\n\nstatic inline unsigned int abk_close_range_limit(struct fdtable *fdt,\n\t\t\t\t\t       unsigned int max_fd)\n{\n\tunsigned int limit = fdt->max_fds - 1;\n\n\treturn min(limit, max_fd);\n}\n\nstatic struct file *abk_pick_file_for_close(struct files_struct *files,\n\t\t\t\t\t   unsigned int fd)\n{\n\tlockdep_assert_held(&files->file_lock);\n\treturn pick_file(files, fd);\n}\n"""
-    text = replace_once(text, pick_old, pick_new, "feature_porting/close_range_pick")
+    pick_helper_block = """\n\n/* ABK feature_porting: close_range() bitmap hotpath graft. */\nstatic inline unsigned int abk_close_range_limit(struct fdtable *fdt,\n\t\t\t\t\t       unsigned int max_fd)\n{\n\tunsigned int limit = fdt->max_fds - 1;\n\n\treturn min(limit, max_fd);\n}\n\nstatic struct file *abk_pick_file_for_close(struct files_struct *files,\n\t\t\t\t\t   unsigned int fd)\n{\n\tlockdep_assert_held(&files->file_lock);\n\treturn pick_file(files, fd);\n}\n"""
+    pick_signature = "static struct file *pick_file(struct files_struct *files, unsigned fd)\n{"
+    if pick_old in text:
+        text = replace_once(text, pick_old, pick_new, "feature_porting/close_range_pick")
+    else:
+        pick_start, pick_end = find_c_block(text, pick_signature, "feature_porting/close_range_pick")
+        pick_scope = text[pick_start:pick_end]
+        if "if (!fd_is_open(fd, fdt))" not in pick_scope:
+            pick_scope = replace_once(
+                pick_scope,
+                "\tif (fd >= fdt->max_fds)\n\t\treturn NULL;\n",
+                "\tif (fd >= fdt->max_fds)\n\t\treturn NULL;\n\tif (!fd_is_open(fd, fdt))\n\t\treturn NULL;\n",
+                "feature_porting/close_range_pick",
+            )
+            text = text[:pick_start] + pick_scope + text[pick_end:]
+        if "static inline unsigned int abk_close_range_limit(" not in text:
+            _, pick_end = find_c_block(text, pick_signature, "feature_porting/close_range_pick")
+            text = text[:pick_end] + pick_helper_block + text[pick_end:]
 
     range_old = """static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,\n\t\t\t\t unsigned int max_fd)\n{\n\tunsigned n;\n\n\trcu_read_lock();\n\tn = last_fd(files_fdtable(cur_fds));\n\trcu_read_unlock();\n\tmax_fd = min(max_fd, n);\n\n\twhile (fd <= max_fd) {\n\t\tstruct file *file;\n\n\t\tspin_lock(&cur_fds->file_lock);\n\t\tfile = pick_file(cur_fds, fd++);\n\t\tspin_unlock(&cur_fds->file_lock);\n\n\t\tif (file) {\n\t\t\t/* found a valid file to close */\n\t\t\tfilp_close(file, cur_fds);\n\t\t\tcond_resched();\n\t\t}\n\t}\n}\n"""
     range_new = """static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,\n\t\t\t\t unsigned int max_fd)\n{\n\tstruct file *file;\n\tstruct fdtable *fdt;\n\tunsigned int n;\n\n\tspin_lock(&cur_fds->file_lock);\n\tfdt = files_fdtable(cur_fds);\n\tn = last_fd(fdt);\n\tmax_fd = min(max_fd, n);\n\n\tfor (fd = find_next_bit(fdt->open_fds, max_fd + 1, fd);\n\t     fd <= max_fd;\n\t     fd = find_next_bit(fdt->open_fds, max_fd + 1, fd + 1)) {\n\t\tfile = abk_pick_file_for_close(cur_fds, fd);\n\t\tif (file) {\n\t\t\tspin_unlock(&cur_fds->file_lock);\n\t\t\tfilp_close(file, cur_fds);\n\t\t\tcond_resched();\n\t\t\tspin_lock(&cur_fds->file_lock);\n\t\t\tfdt = files_fdtable(cur_fds);\n\t\t\tmax_fd = abk_close_range_limit(fdt, max_fd);\n\t\t} else if (need_resched()) {\n\t\t\tspin_unlock(&cur_fds->file_lock);\n\t\t\tcond_resched();\n\t\t\tspin_lock(&cur_fds->file_lock);\n\t\t\tfdt = files_fdtable(cur_fds);\n\t\t\tmax_fd = abk_close_range_limit(fdt, max_fd);\n\t\t}\n\t}\n\tspin_unlock(&cur_fds->file_lock);\n}\n"""
@@ -2567,7 +2725,16 @@ def patch_io_uring_nowait_core(common_root: Path, reference_root: Path) -> dict[
     if "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */" not in core_text:
         old = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
         new = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
-        core_text = replace_once(core_text, old, new, "feature_porting/io_uring_core_io_wq_nowait_comment")
+        if old in core_text:
+            core_text = replace_once(core_text, old, new, "feature_porting/io_uring_core_io_wq_nowait_comment")
+        else:
+            core_text = replace_once(
+                core_text,
+                "\t\tif (req->flags & REQ_F_NOWAIT)\n",
+                "\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n"
+                "\t\tif (req->flags & REQ_F_NOWAIT)\n",
+                "feature_porting/io_uring_core_io_wq_nowait_comment",
+            )
 
     if "/* ABK feature_porting: io_uring fixed-file NOWAIT bookkeeping graft. */" not in filetable_h_text:
         old = "#define FFS_NOWAIT\t\t0x1UL\n"
