@@ -21,7 +21,7 @@ abk_abi_patch_suite_clone_mainline_7012() {
   local mainline_ref="$2"
   local mainline_root="$3"
 
-  if git clone --depth 1 --branch "$mainline_ref" "$mainline_repo" "$mainline_root"; then
+  if git clone --depth 1 --branch "$mainline_ref" "$mainline_repo" "$mainline_root" 2>/dev/null; then
     return 0
   fi
 
@@ -31,7 +31,8 @@ abk_abi_patch_suite_clone_mainline_7012() {
     cd "$mainline_root" || exit 1
     git init -q
     git remote add origin "$mainline_repo"
-    git fetch --depth 1 origin "$mainline_ref"
+    git config advice.detachedHead false
+    git fetch --depth 1 origin "$mainline_ref" >/dev/null 2>&1
     git checkout -q FETCH_HEAD
   ) || return 1
 }
@@ -103,7 +104,7 @@ abk_abi_patch_suite_prepare_mainline_7012_root() {
   if [ ! -d "$mainline_root" ]; then
     if [ -n "${GITHUB_WORKSPACE:-}" ]; then
       mkdir -p "$(dirname "$mainline_root")"
-      abk_log "prepare 7.0.12 reference tree for ABK CI: $mainline_repo @ $mainline_ref -> $mainline_root"
+      abk_log "prepare 7.0.12 reference tree for ABK CI: $mainline_repo @ $mainline_ref -> $mainline_root" >&2
       abk_abi_patch_suite_clone_mainline_7012 "$mainline_repo" "$mainline_ref" "$mainline_root" \
         || abk_die "failed to clone 7.0.12 reference tree from $mainline_repo @ $mainline_ref into $mainline_root"
     else
@@ -116,15 +117,14 @@ abk_abi_patch_suite_prepare_mainline_7012_root() {
   [ -n "$kernelversion" ] || abk_die "unable to resolve kernelversion for mainline tree: $mainline_root"
   case "$kernelversion" in
     7.0.12|7.0.12-*)
+      export ABK_MAINLINE_7012_ROOT="$mainline_root"
+      printf '%s\n' "$mainline_root"
       return 0
       ;;
     *)
       abk_die "expected 7.0.12-family tree, found $kernelversion at $mainline_root"
       ;;
   esac
-
-  export ABK_MAINLINE_7012_ROOT="$mainline_root"
-  printf '%s\n' "$mainline_root"
 }
 
 abk_abi_patch_suite_require_mainline_7012() {
