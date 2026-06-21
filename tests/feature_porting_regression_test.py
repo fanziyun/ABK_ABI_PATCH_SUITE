@@ -984,6 +984,30 @@ class FeaturePortingRegressionTest(unittest.TestCase):
             ["\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */"],
         )
 
+    def test_io_uring_nowait_core_accepts_space_indented_nowait_line(self) -> None:
+        make_io_uring_fixture(self.root, exact_comment_shape=False)
+
+        io_uring_path = self.root / "io_uring/io_uring.c"
+        drifted = io_uring_path.read_text().replace(
+            "\t\t/* 6.1.25 keeps NOWAIT final here, but not the newer comment block. */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n",
+            "        /* 6.1.25 keeps NOWAIT final here, but not the newer comment block. */\n\n        if (req->flags & REQ_F_NOWAIT)\n                break;\n",
+            1,
+        )
+        io_uring_path.write_text(drifted)
+
+        result = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        core_text = io_uring_path.read_text()
+        self.assertIn("        /* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */", core_text)
+        self.assert_count(
+            core_text,
+            "/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */",
+        )
+
+        rerun = FEATURE_PORTING.patch_io_uring_nowait_core(self.root, self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
     def test_fd_alloc_hotpath_accepts_61_57_helperless_shape(self) -> None:
         make_fd_alloc_fixture(self.root, with_fdt_words=False)
 
@@ -1044,6 +1068,27 @@ alloc_fdtable(unsigned int nr)""",
         text = (self.root / "fs/file.c").read_text()
         self.assertIn("static struct fdtable *alloc_fdtable(unsigned int slots_wanted)", text)
         self.assertIn("slots_wanted = abk_fdtable_slots_wanted(slots_wanted);", text)
+        self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_fd_alloc_hotpath_accepts_space_indented_slots_wanted_capacity(self) -> None:
+        make_fd_alloc_fixture(
+            self.root,
+            with_fdt_words=False,
+            alloc_signature="static struct fdtable *alloc_fdtable(unsigned int slots_wanted)",
+            alloc_locals="""\tstruct fdtable *fdt;\n\tunsigned int nr;\n\tvoid *data;\n\n""",
+            alloc_capacity_block="""        nr = ALIGN(slots_wanted, BITS_PER_LONG);\n""",
+        )
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+
+        text = (self.root / "fs/file.c").read_text()
+        self.assertIn("        slots_wanted = abk_fdtable_slots_wanted(slots_wanted);", text)
+        self.assertIn("        nr = ALIGN(slots_wanted, BITS_PER_LONG);", text)
         self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
         self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
 

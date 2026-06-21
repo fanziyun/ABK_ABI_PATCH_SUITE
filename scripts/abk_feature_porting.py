@@ -1092,8 +1092,7 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: start anchor missing")
         alloc_param = alloc_scope_match.group("alloc_param")
         capacity_old = """\tnr /= (1024 / sizeof(struct file *));\n\tnr = roundup_pow_of_two(nr + 1);\n\tnr *= (1024 / sizeof(struct file *));\n\tnr = ALIGN(nr, BITS_PER_LONG);\n"""
-        capacity_align = "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n"
-        capacity_new = f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" + capacity_align
+        capacity_align_pattern = r"(?m)^(?P<indent>[ \t]*)nr = ALIGN\(\s*slots_wanted\s*,\s*BITS_PER_LONG\s*\);\n"
         sysctl_guard = """\tif (unlikely(nr > sysctl_nr_open))\n\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n"""
         sysctl_guard_new = (
             sysctl_guard
@@ -1115,13 +1114,27 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             alloc_scope = alloc_scope[: brace_idx + 1] + "\n\tunsigned int slots_wanted;\n" + tail
 
         if capacity_old in alloc_scope:
-            alloc_scope = alloc_scope.replace(capacity_old, capacity_new, 1)
-        elif f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" in alloc_scope and capacity_align in alloc_scope:
-            pass
-        elif capacity_align in alloc_scope:
-            alloc_scope = alloc_scope.replace(capacity_align, capacity_new, 1)
+            alloc_scope = alloc_scope.replace(
+                capacity_old,
+                f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n",
+                1,
+            )
         else:
-            raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
+            capacity_align_match = re.search(capacity_align_pattern, alloc_scope)
+            if capacity_align_match:
+                indent = capacity_align_match.group("indent")
+                if f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" not in alloc_scope:
+                    capacity_new = (
+                        f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n"
+                        f"{indent}nr = ALIGN(slots_wanted, BITS_PER_LONG);\n"
+                    )
+                    alloc_scope = (
+                        alloc_scope[: capacity_align_match.start()]
+                        + capacity_new
+                        + alloc_scope[capacity_align_match.end() :]
+                    )
+            else:
+                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
 
         if "INT_MAX / sizeof(struct file *)" not in alloc_scope:
             if sysctl_guard not in alloc_scope:
@@ -2794,18 +2807,21 @@ def patch_io_uring_nowait_core(common_root: Path, reference_root: Path) -> dict[
         raise SystemExit("feature_porting/io_uring_core_io_wq_free_work: expected old or new io_wq_free_work shape missing")
 
     if nowait_comment_marker not in core_text:
+        label = "feature_porting/io_uring_core_io_wq_nowait_comment"
+        wq_start, wq_end = find_c_block(core_text, "void io_wq_submit_work(struct io_wq_work *work)\n{", label)
+        wq_scope = core_text[wq_start:wq_end]
         old = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
         new = """\t\t/*\n\t\t * If REQ_F_NOWAIT is set, then don't wait or retry with\n\t\t * poll. -EAGAIN is final for that case.\n\t\t */\n\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n\t\tif (req->flags & REQ_F_NOWAIT)\n\t\t\tbreak;\n"""
-        if old in core_text:
-            core_text = replace_once(core_text, old, new, "feature_porting/io_uring_core_io_wq_nowait_comment")
+        if old in wq_scope:
+            wq_scope = wq_scope.replace(old, new, 1)
         else:
-            core_text = replace_once(
-                core_text,
-                "\t\tif (req->flags & REQ_F_NOWAIT)\n",
-                "\t\t/* ABK feature_porting: only keep NOWAIT final when the request explicitly requested it. */\n"
-                "\t\tif (req->flags & REQ_F_NOWAIT)\n",
-                "feature_porting/io_uring_core_io_wq_nowait_comment",
-            )
+            nowait_match = re.search(r"(?m)^(?P<indent>[ \t]*)if \(req->flags & REQ_F_NOWAIT\)\n", wq_scope)
+            if not nowait_match:
+                raise SystemExit(f"{label}: expected block missing")
+            indent = nowait_match.group("indent")
+            marker_line = f"{indent}{nowait_comment_marker}\n"
+            wq_scope = wq_scope[: nowait_match.start()] + marker_line + wq_scope[nowait_match.start() :]
+        core_text = core_text[:wq_start] + wq_scope + core_text[wq_end:]
 
     if "/* ABK feature_porting: io_uring fixed-file NOWAIT bookkeeping graft. */" not in filetable_h_text:
         old = "#define FFS_NOWAIT\t\t0x1UL\n"
