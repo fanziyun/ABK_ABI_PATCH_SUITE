@@ -56,6 +56,28 @@ abk_abi_patch_suite_local_origin_root() {
   printf '%s\n' "$origin_path"
 }
 
+abk_abi_patch_suite_local_source_root() {
+  local source_path="${ABK_MODULE_GROUP_REPO_URL:-}"
+
+  [ -n "$source_path" ] || return 1
+
+  case "$source_path" in
+    http://*|https://*|git://*|ssh://*|git@*)
+      return 1
+      ;;
+  esac
+
+  if ! source_path="$(abk_abi_patch_suite_realpath_dir "$source_path" 2>/dev/null)"; then
+    if [ -n "${ROOT_DIR:-}" ]; then
+      source_path="$(abk_abi_patch_suite_realpath_dir "$ROOT_DIR/$source_path" 2>/dev/null)" || return 1
+    else
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$source_path"
+}
+
 abk_abi_patch_suite_clone_mainline_7012() {
   local mainline_repo="$1"
   local mainline_ref="$2"
@@ -80,6 +102,8 @@ abk_abi_patch_suite_clone_mainline_7012() {
 abk_abi_patch_suite_mainline_root() {
   local module_parent
   local repo_local_linux
+  local local_source_root
+  local source_local_linux
   local local_origin_root
   local origin_local_linux
 
@@ -98,6 +122,15 @@ abk_abi_patch_suite_mainline_root() {
   if [ -n "${GITHUB_WORKSPACE:-}" ]; then
     printf '%s/reference/linux\n' "$GITHUB_WORKSPACE"
     return 0
+  fi
+
+  local_source_root="$(abk_abi_patch_suite_local_source_root || true)"
+  if [ -n "$local_source_root" ]; then
+    source_local_linux="$(cd "$local_source_root/.." && pwd -P)/linux"
+    if [ -d "$source_local_linux" ]; then
+      printf '%s\n' "$source_local_linux"
+      return 0
+    fi
   fi
 
   local_origin_root="$(abk_abi_patch_suite_local_origin_root || true)"

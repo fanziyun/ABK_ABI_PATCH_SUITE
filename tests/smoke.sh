@@ -213,17 +213,14 @@ grep -Fq 'ABK ABI fixups: runtime ABI followups remain deferred beyond loader-ad
 grep -Fq 'ABK ABI fixups: basic loader compat is global for 7.0.12-family modules.' "$TMP_DIR/kernel/common/kernel/module/version.c"
 
 INJECTED_MODULE_DIR="$TMP_DIR/workspace/custom_modules/ABK_ABI_PATCH_SUITE"
-git clone -q "$MODULE_DIR" "$INJECTED_MODULE_DIR"
-rm -rf "$INJECTED_MODULE_DIR/scripts"
-cp -a "$MODULE_DIR/setup.sh" "$INJECTED_MODULE_DIR/setup.sh"
-cp -a "$MODULE_DIR/module.conf" "$INJECTED_MODULE_DIR/module.conf"
-cp -a "$MODULE_DIR/scripts" "$INJECTED_MODULE_DIR/scripts"
-git -C "$INJECTED_MODULE_DIR" remote set-url origin "$MODULE_DIR"
+mkdir -p "$INJECTED_MODULE_DIR"
+rsync -a --delete --exclude='.git' "$MODULE_DIR"/ "$INJECTED_MODULE_DIR"/
 LOCAL_INJECTED_REPORT_DIR="$TMP_DIR/reports-local-injected"
 KERNEL_ROOT="$TMP_DIR/kernel-local-injected" \
 DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
 ABK_MODULE_CHILD_ID=abi_bridge \
+ABK_MODULE_GROUP_REPO_URL="$MODULE_DIR" \
 ABK_ABI_BRIDGE_REPORT_DIR="$LOCAL_INJECTED_REPORT_DIR" \
   bash "$INJECTED_MODULE_DIR/setup.sh" >/dev/null
 
