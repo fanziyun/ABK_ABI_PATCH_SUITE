@@ -16,6 +16,46 @@ abk_abi_patch_suite_mainline_ref() {
   printf '%s\n' "${ABK_MAINLINE_7012_REF:-v7.0.12-arch1}"
 }
 
+abk_abi_patch_suite_realpath_dir() {
+  local path="$1"
+
+  [ -d "$path" ] || return 1
+  (
+    cd "$path" || exit 1
+    pwd -P
+  )
+}
+
+abk_abi_patch_suite_local_origin_root() {
+  local origin_url
+  local origin_path
+
+  origin_url="$(git -C "$MODULE_DIR" remote get-url origin 2>/dev/null || true)"
+  [ -n "$origin_url" ] || return 1
+
+  case "$origin_url" in
+    file://*)
+      origin_path="${origin_url#file://}"
+      ;;
+    /*|./*|../*)
+      origin_path="$origin_url"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  if ! origin_path="$(abk_abi_patch_suite_realpath_dir "$origin_path" 2>/dev/null)"; then
+    origin_path="$(abk_abi_patch_suite_realpath_dir "$MODULE_DIR/$origin_path" 2>/dev/null)" || return 1
+  fi
+
+  if [ "$(basename "$origin_path")" = ".git" ]; then
+    origin_path="$(abk_abi_patch_suite_realpath_dir "$origin_path/.." 2>/dev/null)" || return 1
+  fi
+
+  printf '%s\n' "$origin_path"
+}
+
 abk_abi_patch_suite_clone_mainline_7012() {
   local mainline_repo="$1"
   local mainline_ref="$2"
@@ -40,6 +80,8 @@ abk_abi_patch_suite_clone_mainline_7012() {
 abk_abi_patch_suite_mainline_root() {
   local module_parent
   local repo_local_linux
+  local local_origin_root
+  local origin_local_linux
 
   if [ -n "${ABK_MAINLINE_7012_ROOT:-}" ]; then
     printf '%s\n' "$ABK_MAINLINE_7012_ROOT"
@@ -56,6 +98,15 @@ abk_abi_patch_suite_mainline_root() {
   if [ -n "${GITHUB_WORKSPACE:-}" ]; then
     printf '%s/reference/linux\n' "$GITHUB_WORKSPACE"
     return 0
+  fi
+
+  local_origin_root="$(abk_abi_patch_suite_local_origin_root || true)"
+  if [ -n "$local_origin_root" ]; then
+    origin_local_linux="$(cd "$local_origin_root/.." && pwd -P)/linux"
+    if [ -d "$origin_local_linux" ]; then
+      printf '%s\n' "$origin_local_linux"
+      return 0
+    fi
   fi
 
   printf '%s\n' "$repo_local_linux"

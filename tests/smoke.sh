@@ -140,6 +140,7 @@ cp -a "$COMMON_DIR/include/uapi/linux/bpf.h" "$TMP_DIR/kernel/common/include/uap
 cp -a "$COMMON_DIR/include/uapi/linux/filter.h" "$TMP_DIR/kernel/common/include/uapi/linux/filter.h"
 cp -a "$COMMON_DIR/kernel/module/internal.h" "$TMP_DIR/kernel/common/kernel/module/internal.h"
 [ ! -d "$COMMON_DIR/android" ] || cp -a "$COMMON_DIR/android"/abi_gki_aarch64* "$TMP_DIR/kernel/common/android/" 2>/dev/null || true
+cp -a "$TMP_DIR/kernel" "$TMP_DIR/kernel-local-injected"
 cat > "$TMP_DIR/defconfig" <<'EOF'
 CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure bootconfig"
 CONFIG_CMDLINE_EXTEND=y
@@ -210,6 +211,27 @@ grep -Fq 'CONFIG_ABK_DUAL_ABI_BRIDGE' "$TMP_DIR/kernel/common/kernel/module/vers
 grep -Fq 'ABK ABI fixups: basic loader compat applied for global 7.0.12-family bridge.' "$TMP_DIR/kernel/common/kernel/module/version.c"
 grep -Fq 'ABK ABI fixups: runtime ABI followups remain deferred beyond loader-adjacent glue.' "$TMP_DIR/kernel/common/kernel/module/version.c"
 grep -Fq 'ABK ABI fixups: basic loader compat is global for 7.0.12-family modules.' "$TMP_DIR/kernel/common/kernel/module/version.c"
+
+INJECTED_MODULE_DIR="$TMP_DIR/workspace/custom_modules/ABK_ABI_PATCH_SUITE"
+git clone -q "$MODULE_DIR" "$INJECTED_MODULE_DIR"
+rm -rf "$INJECTED_MODULE_DIR/scripts"
+cp -a "$MODULE_DIR/setup.sh" "$INJECTED_MODULE_DIR/setup.sh"
+cp -a "$MODULE_DIR/module.conf" "$INJECTED_MODULE_DIR/module.conf"
+cp -a "$MODULE_DIR/scripts" "$INJECTED_MODULE_DIR/scripts"
+git -C "$INJECTED_MODULE_DIR" remote set-url origin "$MODULE_DIR"
+LOCAL_INJECTED_REPORT_DIR="$TMP_DIR/reports-local-injected"
+KERNEL_ROOT="$TMP_DIR/kernel-local-injected" \
+DEFCONFIG="$TMP_DIR/defconfig" \
+CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
+ABK_MODULE_CHILD_ID=abi_bridge \
+ABK_ABI_BRIDGE_REPORT_DIR="$LOCAL_INJECTED_REPORT_DIR" \
+  bash "$INJECTED_MODULE_DIR/setup.sh" >/dev/null
+
+[ -f "$LOCAL_INJECTED_REPORT_DIR/bridge_report.md" ]
+[ -f "$LOCAL_INJECTED_REPORT_DIR/bridge_report.json" ]
+grep -Fq 'ABK Dual ABI/KMI Bridge Report' "$LOCAL_INJECTED_REPORT_DIR/bridge_report.md"
+grep -Fq '7.0.12-arch1' "$LOCAL_INJECTED_REPORT_DIR/bridge_report.md"
+grep -Fq '"bridge_global_7012_enabled": true' "$LOCAL_INJECTED_REPORT_DIR/bridge_report.json"
 
 REPORT_DIR="$TMP_DIR/reports-experimental"
 KERNEL_ROOT="$TMP_DIR/kernel" \
