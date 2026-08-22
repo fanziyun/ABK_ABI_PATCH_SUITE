@@ -46,14 +46,31 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"usage: {argv[0]} <current-common-root>")
 
     common_root = Path(argv[1])
-    version_c = common_root / "kernel/module/version.c"
-    internal_h = common_root / "kernel/module/internal.h"
-    main_c = common_root / "kernel/module/main.c"
+
+    # 6.1 splits the loader across kernel/module/{version,main}.c plus
+    # internal.h; 5.15 keeps all of it in kernel/module.c, so every check below
+    # collapses onto that one file.
+    split_version_c = common_root / "kernel/module/version.c"
+    if split_version_c.is_file():
+        version_c = split_version_c
+        internal_h = common_root / "kernel/module/internal.h"
+        main_c = common_root / "kernel/module/main.c"
+    else:
+        single = common_root / "kernel/module.c"
+        if not single.is_file():
+            raise SystemExit(
+                "abi_fixups: no module loader found; expected "
+                f"kernel/module/version.c or kernel/module.c under {common_root}"
+            )
+        version_c = single
+        internal_h = None
+        main_c = single
 
     ensure_contains(version_c, "abk_dual_abi_bridge_module_allowed", "abi_fixups")
     ensure_contains(version_c, "abk_dual_abi_bridge_release_allowed", "abi_fixups")
     ensure_contains(version_c, "ABK dual ABI bridge: allow 7.0.12-family symbol CRC mismatch", "abi_fixups")
-    ensure_contains(internal_h, "abk_dual_abi_bridge_module_allowed", "abi_fixups")
+    if internal_h is not None:
+        ensure_contains(internal_h, "abk_dual_abi_bridge_module_allowed", "abi_fixups")
     ensure_contains(main_c, "abk_dual_abi_bridge_note_vermagic", "abi_fixups")
 
     replace_first_existing(

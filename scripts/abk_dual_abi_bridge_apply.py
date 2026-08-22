@@ -5,6 +5,43 @@ import sys
 from pathlib import Path
 
 
+def resolve_layout(common_root: Path) -> dict[str, object]:
+    """Locate the module loader, whichever layout this tree uses.
+
+    6.1 split kernel/module.c into kernel/module/{main.c,version.c,internal.h}.
+    5.15 still has the single file, and it holds the same three functions the
+    bridge rewrites -- same_magic(), check_version() and
+    check_modstruct_version() -- so the split is a matter of where the code
+    lives, not whether it exists.
+
+    On the single-file layout all three passes target that one file, and the
+    declarations 6.1 needs in internal.h are unnecessary: the helpers are
+    defined in the same translation unit as their callers.
+    """
+    split_main = common_root / "kernel/module/main.c"
+    if split_main.is_file():
+        return {
+            "single_file": False,
+            "internal_h": common_root / "kernel/module/internal.h",
+            "version_c": common_root / "kernel/module/version.c",
+            "main_c": split_main,
+        }
+
+    single = common_root / "kernel/module.c"
+    if single.is_file():
+        return {
+            "single_file": True,
+            "internal_h": None,
+            "version_c": single,
+            "main_c": single,
+        }
+
+    raise SystemExit(
+        "abi_bridge: no module loader found; expected kernel/module/main.c "
+        f"or kernel/module.c under {common_root}"
+    )
+
+
 def replace_once(path: Path, old: str, new: str, label: str) -> None:
     text = path.read_text()
     if new in text:
@@ -21,6 +58,27 @@ def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
     if anchor not in text:
         raise SystemExit(f"{label}: anchor not found in {path}")
     path.write_text(text.replace(anchor, anchor + snippet, 1))
+
+
+def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -> None:
+    """Insert after the first anchor present.
+
+    The helper block goes after a different landmark depending on layout: 6.1's
+    kernel/module/version.c opens with #include "internal.h", while 5.15's
+    single kernel/module.c has no such include. There the vermagic[] definition
+    serves -- it sits ahead of try_to_force_load() and of every call site the
+    bridge hooks, so the helpers are declared before use.
+    """
+    text = path.read_text()
+    if snippet in text:
+        return
+
+    for anchor in anchors:
+        if anchor in text:
+            path.write_text(text.replace(anchor, anchor + snippet, 1))
+            return
+
+    raise SystemExit(f"{label}: no known anchor found in {path}")
 
 
 def replace_policy_header(path: Path, policy_define: str) -> None:
@@ -229,9 +287,12 @@ def patch_version_c(path: Path, policy: str) -> None:
         "}\n\n"
     )
 
-    ensure_after(
+    ensure_after_any(
         path,
-        '#include "internal.h"\n',
+        [
+            '#include "internal.h"\n',
+            "static const char vermagic[] = VERMAGIC_STRING;\n",
+        ],
         helper_block,
         "kernel/module/version.c",
     )
@@ -363,9 +424,18 @@ def main(argv: list[str]) -> int:
 
     common_root = Path(argv[1])
     policy = argv[2]
-    patch_internal_h(common_root / "kernel/module/internal.h")
-    patch_version_c(common_root / "kernel/module/version.c", policy)
-    patch_main_c(common_root / "kernel/module/main.c")
+    layout = resolve_layout(common_root)
+
+    if layout["single_file"]:
+        print(
+            "::warning::abi_bridge: single-file kernel/module.c layout; the "
+            "bridge lands there and needs no internal.h declarations"
+        )
+    else:
+        patch_internal_h(layout["internal_h"])
+
+    patch_version_c(layout["version_c"], policy)
+    patch_main_c(layout["main_c"])
     return 0
 
 

@@ -191,15 +191,18 @@ abk_abi_patch_suite_sub_level() {
   abk_kernel_make_value SUBLEVEL
 }
 
-# True when a capability cannot exist on the target tree at all — the files or
-# types it rewrites are absent, so no anchor rewrite can recover it.
+# True when a capability cannot exist on the target tree at all — the types it
+# rewrites are absent, so no anchor rewrite can recover it.
 #
 # Verified against real deprecated/android13-5.15-2024-11 (SUBLEVEL 167) source:
-#   slab_hotpath  struct slab arrived in 5.17; 5.15 SLUB is built on struct page
-#   swap_table    mm/swap.h does not exist in 5.15
-#   io_uring      5.15 io_uring/ holds only io_uring.c, io-wq.c, io-wq.h
-#   abi_bridge    5.15 has kernel/module.c, not kernel/module/{version,main}.c
-#   eevdf_logic   fair.c shape differs and vendor hooks own pick_next_entity
+#   swap_table  mm/swap.h does not exist in 5.15
+#   io_uring    5.15 io_uring/ holds only io_uring.c, io-wq.c, io-wq.h
+#
+# Deliberately not listed:
+#   slab_hotpath  the graft never touches struct slab; it lands on 5.15
+#   eevdf_logic   fair.c differences are renames, handled by fair_shape_for_tree()
+#   abi_bridge    5.15 keeps the same three functions in a single
+#                 kernel/module.c; resolve_layout() finds them there
 abk_abi_patch_suite_capability_unportable() {
   local capability="$1"
   local kernel_version
@@ -209,7 +212,7 @@ abk_abi_patch_suite_capability_unportable() {
   case "$kernel_version" in
     5.10|5.15)
       case "$capability" in
-        slab_hotpath|swap_table|io_uring|abi_bridge|eevdf_logic)
+        swap_table|io_uring)
           return 0
           ;;
       esac
@@ -332,6 +335,25 @@ abk_abi_patch_suite_bridge_apply_env() {
   esac
 }
 
+# The module loader lives in kernel/module/{main,version}.c on 6.1 and in a
+# single kernel/module.c on 5.15. Either satisfies the bridge; resolve_layout()
+# in abk_dual_abi_bridge_apply.py picks the right one.
+abk_abi_patch_suite_require_module_loader() {
+  local common_dir="$1"
+
+  if [ -f "$common_dir/kernel/module/main.c" ] && [ -f "$common_dir/kernel/module/version.c" ]; then
+    abk_log "module loader layout: kernel/module/ (split)"
+    return 0
+  fi
+
+  if [ -f "$common_dir/kernel/module.c" ]; then
+    abk_log "module loader layout: kernel/module.c (single file)"
+    return 0
+  fi
+
+  abk_die "no module loader found: expected kernel/module/main.c or kernel/module.c under $common_dir"
+}
+
 abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
   local common_dir
   local mainline_root
@@ -342,8 +364,7 @@ abk_abi_patch_suite_apply_dual_abi_kmi_bridge() {
   mainline_root="$(abk_abi_patch_suite_prepare_mainline_7012_root)"
   report_dir="$(abk_abi_patch_suite_bridge_report_dir)"
 
-  abk_require_file "$common_dir/kernel/module/version.c"
-  abk_require_file "$common_dir/kernel/module/main.c"
+  abk_abi_patch_suite_require_module_loader "$common_dir"
   abk_require_file "$common_dir/include/linux/vermagic.h"
   abk_require_file "$common_dir/include/linux/module.h"
   abk_require_file "$DEFCONFIG"
@@ -366,8 +387,7 @@ abk_abi_patch_suite_apply_abi_fixups() {
 
   abk_log "apply child: abi_fixups"
   common_dir="$(abk_abi_patch_suite_common_dir)"
-  abk_require_file "$common_dir/kernel/module/version.c"
-  abk_require_file "$common_dir/kernel/module/internal.h"
+  abk_abi_patch_suite_require_module_loader "$common_dir"
   python3 "$MODULE_DIR/scripts/abk_abi_fixups.py" "$common_dir"
   abk_log "ABI fixups compat batch applied"
 }
@@ -561,11 +581,6 @@ abk_abi_patch_suite_apply_framebuffer_bootlog() {
 }
 
 abk_abi_patch_suite_apply_abi_bridge() {
-  if abk_abi_patch_suite_capability_unportable abi_bridge; then
-    abk_warn "abi_bridge skipped on $(abk_abi_patch_suite_target_family): the loader lives in kernel/module.c, not kernel/module/{version,main}.c, so the bridge has no target to rewrite"
-    return 0
-  fi
-
   abk_abi_patch_suite_apply_dual_abi_kmi_bridge
   abk_abi_patch_suite_apply_abi_fixups
   abk_log "ABI bridge child completed: bridge preflight, loader policy, and loader-adjacent fixups"

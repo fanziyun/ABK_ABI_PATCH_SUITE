@@ -86,8 +86,26 @@ def extract_macro(text: str, macro_name: str) -> str | None:
     return None
 
 
+def module_loader_source(root: Path) -> Path:
+    """Return whichever file holds the module loader.
+
+    same_magic(), check_version() and check_modstruct_version() live in
+    kernel/module/version.c on 6.1 and in a single kernel/module.c on 5.15.
+    """
+    split = root / "kernel/module/version.c"
+    if split.is_file():
+        return split
+    single = root / "kernel/module.c"
+    if single.is_file():
+        return single
+    raise SystemExit(
+        "bridge report: no module loader found; expected "
+        f"kernel/module/version.c or kernel/module.c under {root}"
+    )
+
+
 def extract_source_blocks(root: Path) -> dict[str, str | None]:
-    version_c = read_text(root / "kernel/module/version.c")
+    version_c = read_text(module_loader_source(root))
     vermagic_h = read_text(root / "include/linux/vermagic.h")
     module_h = read_text(root / "include/linux/module.h")
     return {
