@@ -267,6 +267,57 @@ def replace_once_fair(text: str, old: str, new: str, label: str) -> str:
     )
 
 
+# Block layer shape differences between android14-6.1 and android13-5.15.
+#
+# Unlike the fair.c set these are not all renames: 6.1 carries request flags
+# (RQF_ELV, RQF_RESV) and a queue flag (QUEUE_FLAG_SQ_SCHED) that do not exist
+# on 5.15, and it embeds sbitmap_queue in blk_mq_tags where 5.15 points at it.
+# So the substitutions below cover naming and access form; call sites that lean
+# on an absent flag are rewritten per-site in patch_blk_mq_async_depth().
+#
+# Verified against deprecated/android13-5.15-2024-11 (SUBLEVEL 167).
+_BLK_5_15_RENAMES = (
+    ("BLKDEV_DEFAULT_RQ", "BLKDEV_MAX_RQ"),
+    ("blk_mq_is_shared_tags(", "blk_mq_is_sbitmap_shared("),
+    ("__blk_mq_alloc_requests(", "__blk_mq_alloc_request("),
+)
+
+# blk_opf_t is a 6.1 addition: the request operation carried as a distinct type
+# instead of a bare unsigned int. Rewrite it wherever the tree lacks the typedef,
+# including in code the graft introduces.
+_BLK_OPF_T = "blk_opf_t "
+
+
+def blk_shape_for_tree(text: str, snippet: str) -> str:
+    """Rewrite a block-layer literal into the shape this tree uses."""
+    for new_name, old_name in _BLK_5_15_RENAMES:
+        if new_name in snippet and new_name not in text and old_name in text:
+            snippet = snippet.replace(new_name, old_name)
+
+    if _BLK_OPF_T in snippet and "blk_opf_t" not in text:
+        snippet = snippet.replace(_BLK_OPF_T, "unsigned int ")
+        snippet = snippet.replace("blk_opf_t,", "unsigned int,")
+
+    # 6.1 embeds the sbitmap_queue in struct blk_mq_tags; 5.15 points at it, so
+    # dereferences need -> and taking the member's address would yield
+    # sbitmap_queue **. A "bitmap_tags->" already in the file is the tell.
+    if "bitmap_tags->" in text:
+        snippet = re.sub(r"&(\w+(?:->\w+)*)->bitmap_tags\b", r"\1->bitmap_tags", snippet)
+        snippet = snippet.replace("bitmap_tags.", "bitmap_tags->")
+
+    return snippet
+
+
+def replace_once_blk(text: str, old: str, new: str, label: str) -> str:
+    """replace_once() that tolerates block-layer shape drift."""
+    return replace_once(
+        text,
+        blk_shape_for_tree(text, old),
+        blk_shape_for_tree(text, new),
+        label,
+    )
+
+
 def replace_within(text: str, start: str, end: str, old: str, new: str, label: str) -> str:
     start_idx = text.find(start)
     if start_idx < 0:
@@ -1412,17 +1463,53 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
     kyber_text = read_text(kyber_c)
 
     ensure_contains(blkdev_h, "struct request_queue {\n", "feature_porting/blk_async_depth_blkdev")
-    ensure_contains(blk_core_c, "q->nr_requests = BLKDEV_DEFAULT_RQ;", "feature_porting/blk_async_depth_blk_core")
-    ensure_contains(blk_mq_c, "static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)", "feature_porting/blk_async_depth_blk_mq")
+    ensure_contains_any(
+        blk_core_c,
+        [
+            "q->nr_requests = BLKDEV_DEFAULT_RQ;",
+            "q->nr_requests = BLKDEV_MAX_RQ;",
+        ],
+        "feature_porting/blk_async_depth_blk_core",
+    )
+    ensure_contains_any(
+        blk_mq_c,
+        [
+            "static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)",
+            "static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)",
+        ],
+        "feature_porting/blk_async_depth_blk_mq",
+    )
     ensure_contains(blk_mq_sched_c, "int blk_mq_init_sched(struct request_queue *q, struct elevator_type *e)", "feature_porting/blk_async_depth_blk_mq_sched")
     ensure_contains(blk_sysfs_c, 'QUEUE_RW_ENTRY(queue_requests, "nr_requests");', "feature_porting/blk_async_depth_blk_sysfs")
-    ensure_contains(elevator_c, "static int elevator_switch_mq(struct request_queue *q,", "feature_porting/blk_async_depth_elevator")
-    ensure_contains(dd_c, "static void dd_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)", "feature_porting/blk_async_depth_deadline")
+    ensure_contains_any(
+        elevator_c,
+        [
+            "static int elevator_switch_mq(struct request_queue *q,",
+            "static int elevator_switch(struct request_queue *q,",
+        ],
+        "feature_porting/blk_async_depth_elevator",
+    )
+    ensure_contains_any(
+        dd_c,
+        [
+            # blk_opf_t arrived in 6.1; 5.15 passes the raw unsigned int.
+            "static void dd_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)",
+            "static void dd_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)",
+        ],
+        "feature_porting/blk_async_depth_deadline",
+    )
     ensure_contains(bfq_c, "static void bfq_depth_updated(struct blk_mq_hw_ctx *hctx)", "feature_porting/blk_async_depth_bfq")
     ensure_contains(kyber_c, "static void kyber_depth_updated(struct blk_mq_hw_ctx *hctx)", "feature_porting/blk_async_depth_kyber")
 
     rq_start = "struct request_queue {\n"
+    # Scope the KABI slot rewrite to struct request_queue. 6.1 has an @srcu
+    # member to bound against; 5.15 does not, so fall back to the struct's own
+    # closing brace.
     rq_end = "\n\t/**\n\t * @srcu: Sleepable RCU. Use as lock when type of the request queue\n"
+    if rq_end not in blkdev_text:
+        rq_end = "\n\tANDROID_OEM_DATA(1);\n};\n"
+        if rq_end not in blkdev_text:
+            rq_end = "\n};\n"
     rq_old = """\n\tANDROID_KABI_RESERVE(1);\n\tANDROID_KABI_RESERVE(2);\n\tANDROID_KABI_RESERVE(3);\n\tANDROID_KABI_RESERVE(4);\n"""
     rq_new = """\n\tANDROID_KABI_USE(1, unsigned int\t\tasync_depth);\t/* Max # of async requests */\n\tANDROID_KABI_RESERVE(2);\n\tANDROID_KABI_RESERVE(3);\n\tANDROID_KABI_RESERVE(4);\n"""
     stray_async_depth = "ANDROID_KABI_USE(1, unsigned int\t\tasync_depth);\t/* Max # of async requests */"
@@ -1441,10 +1528,19 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
         write_text(blkdev_h, blkdev_text)
         blkdev_text = read_text(blkdev_h)
 
-    blk_core_old = "\tq->nr_requests = BLKDEV_DEFAULT_RQ;\n"
-    blk_core_new = "\tq->nr_requests = BLKDEV_DEFAULT_RQ;\n\tq->async_depth = BLKDEV_DEFAULT_RQ;\n"
-    if "q->async_depth = BLKDEV_DEFAULT_RQ;" not in blk_core_text:
-        blk_core_text = replace_once(blk_core_text, blk_core_old, blk_core_new, "feature_porting/blk_async_depth_blk_core_default")
+    # 6.1 renamed BLKDEV_MAX_RQ to BLKDEV_DEFAULT_RQ; same 128.
+    blk_core_rq_define = (
+        "BLKDEV_DEFAULT_RQ"
+        if "BLKDEV_DEFAULT_RQ" in blk_core_text
+        else "BLKDEV_MAX_RQ"
+    )
+    blk_core_old = f"\tq->nr_requests = {blk_core_rq_define};\n"
+    blk_core_new = (
+        f"\tq->nr_requests = {blk_core_rq_define};\n"
+        f"\tq->async_depth = {blk_core_rq_define};\n"
+    )
+    if f"q->async_depth = {blk_core_rq_define};" not in blk_core_text:
+        blk_core_text = replace_once_blk(blk_core_text, blk_core_old, blk_core_new, "feature_porting/blk_async_depth_blk_core_default")
         write_text(blk_core_c, blk_core_text)
 
     blk_mq_anchor_new = """static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tvoid (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;\n\tstruct request_queue *q = data->q;\n"""
@@ -1454,9 +1550,9 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
     blk_mq_with_marker_old = marker + """\nstatic void blk_mq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)\n{\n\tstruct elevator_queue *e = data->q->elevator;\n\n\tif (!e || !e->type->ops.limit_depth)\n\t\treturn;\n\tif (op_is_flush(opf) || blk_op_is_passthrough(opf) ||\n\t    (data->flags & BLK_MQ_REQ_RESERVED))\n\t\treturn;\n\n\te->type->ops.limit_depth(opf, data);\n}\n\nstatic struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)\n{\n\tvoid (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;\n\tstruct request_queue *q = data->q;\n"""
     if marker not in blk_mq_text:
         if blk_mq_anchor_new in blk_mq_text:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_anchor_new, blk_mq_with_marker_new, "feature_porting/blk_async_depth_blk_mq_add_helper")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_anchor_new, blk_mq_with_marker_new, "feature_porting/blk_async_depth_blk_mq_add_helper")
         else:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_anchor_old, blk_mq_with_marker_old, "feature_porting/blk_async_depth_blk_mq_add_helper")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_anchor_old, blk_mq_with_marker_old, "feature_porting/blk_async_depth_blk_mq_add_helper")
 
     needs_limit_depth_decl = (
         marker in blk_mq_text
@@ -1464,7 +1560,7 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
         or blk_mq_limit_call in blk_mq_text
     )
     if needs_limit_depth_decl and blk_mq_anchor_new not in blk_mq_text and blk_mq_anchor_old in blk_mq_text:
-        blk_mq_text = replace_once(
+        blk_mq_text = replace_once_blk(
             blk_mq_text,
             blk_mq_anchor_old,
             blk_mq_anchor_new,
@@ -1474,103 +1570,157 @@ def patch_blk_mq_async_depth(common_root: Path) -> dict[str, object]:
     blk_mq_limit_old = """\tif (q->elevator) {\n\t\tstruct elevator_queue *e = q->elevator;\n\n\t\tdata->rq_flags |= RQF_ELV;\n\n\t\t/*\n\t\t * Flush/passthrough requests are special and go directly to the\n\t\t * dispatch list. Don't include reserved tags in the\n\t\t * limiting, as it isn't useful.\n\t\t */\n\t\tif (!op_is_flush(data->cmd_flags) &&\n\t\t    !blk_op_is_passthrough(data->cmd_flags) &&\n\t\t    e->type->ops.limit_depth &&\n\t\t    !(data->flags & BLK_MQ_REQ_RESERVED))\n\t\t\tlimit_depth = e->type->ops.limit_depth;\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!(data->rq_flags & RQF_ELV))\n\t\tblk_mq_tag_busy(data->hctx);\n\n\tif (data->flags & BLK_MQ_REQ_RESERVED)\n\t\tdata->rq_flags |= RQF_RESV;\n"""
     blk_mq_limit_old_legacy = """\tif (q->elevator) {\n\t\tstruct elevator_queue *e = q->elevator;\n\n\t\tdata->rq_flags |= RQF_ELV;\n\n\t\t/*\n\t\t * Flush/passthrough requests are special and go directly to the\n\t\t * dispatch list. Don't include reserved tags in the\n\t\t * limiting, as it isn't useful.\n\t\t */\n\t\tif (!op_is_flush(data->cmd_flags) &&\n\t\t    !blk_op_is_passthrough(data->cmd_flags) &&\n\t\t    e->type->ops.limit_depth &&\n\t\t    !(data->flags & BLK_MQ_REQ_RESERVED))\n\t\t\te->type->ops.limit_depth(data->cmd_flags, data);\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!(data->rq_flags & RQF_ELV))\n\t\tblk_mq_tag_busy(data->hctx);\n\n\tif (data->flags & BLK_MQ_REQ_RESERVED)\n\t\tdata->rq_flags |= RQF_RESV;\n"""
     blk_mq_limit_new = """\tif (q->elevator) {\n\t\tdata->rq_flags |= RQF_ELV;\n\t\tlimit_depth = blk_mq_limit_depth;\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!(data->rq_flags & RQF_ELV))\n\t\tblk_mq_tag_busy(data->hctx);\n\n\tif (data->flags & BLK_MQ_REQ_RESERVED)\n\t\tdata->rq_flags |= RQF_RESV;\n"""
+    # 5.15 has no RQF_ELV/RQF_RESV and keys tag_busy off a local elevator
+    # pointer, so its counterpart keeps that pointer and adds only the deferred
+    # limit_depth hand-off. Same effect: the elevator's limit_depth runs after
+    # hctx assignment rather than before.
+    blk_mq_limit_old_5_15 = """\tif (e) {\n\t\t/*\n\t\t * Flush/passthrough requests are special and go directly to the\n\t\t * dispatch list. Don't include reserved tags in the\n\t\t * limiting, as it isn't useful.\n\t\t */\n\t\tif (!op_is_flush(data->cmd_flags) &&\n\t\t    !blk_op_is_passthrough(data->cmd_flags) &&\n\t\t    e->type->ops.limit_depth &&\n\t\t    !(data->flags & BLK_MQ_REQ_RESERVED))\n\t\t\te->type->ops.limit_depth(data->cmd_flags, data);\n\t}\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!e)\n\t\tblk_mq_tag_busy(data->hctx);\n"""
+    blk_mq_limit_new_5_15 = """\tif (e)\n\t\tlimit_depth = blk_mq_limit_depth;\n\nretry:\n\tdata->ctx = blk_mq_get_ctx(q);\n\tdata->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);\n\tif (!e)\n\t\tblk_mq_tag_busy(data->hctx);\n"""
     if "limit_depth = blk_mq_limit_depth;" not in blk_mq_text:
         if blk_mq_limit_old in blk_mq_text:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_limit_old, blk_mq_limit_new, "feature_porting/blk_async_depth_blk_mq_apply_limit")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_limit_old, blk_mq_limit_new, "feature_porting/blk_async_depth_blk_mq_apply_limit")
+        elif blk_mq_limit_old_legacy in blk_mq_text:
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_limit_old_legacy, blk_mq_limit_new, "feature_porting/blk_async_depth_blk_mq_apply_limit")
         else:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_limit_old_legacy, blk_mq_limit_new, "feature_porting/blk_async_depth_blk_mq_apply_limit")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_limit_old_5_15, blk_mq_limit_new_5_15, "feature_porting/blk_async_depth_blk_mq_apply_limit")
 
     blk_mq_init_queue_old = "\tq->nr_requests = set->queue_depth;\n"
     blk_mq_init_queue_new = "\tq->nr_requests = set->queue_depth;\n\tq->async_depth = set->queue_depth;\n"
     if "q->async_depth = set->queue_depth;" not in blk_mq_text:
-        blk_mq_text = replace_once(blk_mq_text, blk_mq_init_queue_old, blk_mq_init_queue_new, "feature_porting/blk_async_depth_blk_mq_queue_init")
+        blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_init_queue_old, blk_mq_init_queue_new, "feature_porting/blk_async_depth_blk_mq_queue_init")
+
+    # Invoke the deferred hook. The whole point of hoisting limit_depth into a
+    # function pointer is to run it after hctx assignment -- the shallow depth it
+    # sets is consumed by __blk_mq_get_tag() -- so the call goes immediately
+    # before blk_mq_get_tag(). 6.1 trees that already carry the call skip this.
+    blk_mq_get_tag_old = "\ttag = blk_mq_get_tag(data);\n"
+    blk_mq_get_tag_new = blk_mq_limit_call + "\n\ttag = blk_mq_get_tag(data);\n"
+    if blk_mq_limit_call not in blk_mq_text:
+        blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_get_tag_old, blk_mq_get_tag_new, "feature_porting/blk_async_depth_blk_mq_limit_call")
 
     blk_mq_resize_old = """\tif (!ret) {\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
     blk_mq_resize_bad = """\tif (!ret) {\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tq->async_depth = max(q->async_depth * nr / q->nr_requests, 1U);\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
     blk_mq_resize_new = """\tif (!ret) {\n\t\tunsigned long new_async_depth;\n\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tnew_async_depth = q->async_depth * nr / q->nr_requests;\n\t\tif (!new_async_depth)\n\t\t\tnew_async_depth = 1;\n\t\tq->async_depth = min_t(unsigned long, new_async_depth, UINT_MAX);\n\t\tq->nr_requests = nr;\n\t\tif (blk_mq_is_shared_tags(set->flags)) {\n"""
+    # The scaling goes in ahead of `q->nr_requests = nr;`, so what follows that
+    # line does not matter. 5.15 guards the shared-tag resize with
+    # `q->elevator &&` and no brace, hence the shorter fallback anchor.
+    blk_mq_resize_old_short = """\tif (!ret) {\n\t\tq->nr_requests = nr;\n"""
+    blk_mq_resize_new_short = """\tif (!ret) {\n\t\tunsigned long new_async_depth;\n\n\t\t/* ABK feature_porting: preserve relative async_depth across nr_requests resize. */\n\t\tnew_async_depth = q->async_depth * nr / q->nr_requests;\n\t\tif (!new_async_depth)\n\t\t\tnew_async_depth = 1;\n\t\tq->async_depth = min_t(unsigned long, new_async_depth, UINT_MAX);\n\t\tq->nr_requests = nr;\n"""
     if "new_async_depth = q->async_depth * nr / q->nr_requests;" not in blk_mq_text:
         if blk_mq_resize_bad in blk_mq_text:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_resize_bad, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_resize_bad, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
+        elif blk_shape_for_tree(blk_mq_text, blk_mq_resize_old) in blk_mq_text:
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_resize_old, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
         else:
-            blk_mq_text = replace_once(blk_mq_text, blk_mq_resize_old, blk_mq_resize_new, "feature_porting/blk_async_depth_blk_mq_resize")
+            blk_mq_text = replace_once_blk(blk_mq_text, blk_mq_resize_old_short, blk_mq_resize_new_short, "feature_porting/blk_async_depth_blk_mq_resize")
         write_text(blk_mq_c, blk_mq_text)
 
     blk_mq_sched_none_old = """\tif (!e) {\n\t\tblk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);\n\t\tq->elevator = NULL;\n\t\tq->nr_requests = q->tag_set->queue_depth;\n\t\treturn 0;\n\t}\n"""
     blk_mq_sched_none_new = """\tif (!e) {\n\t\tblk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);\n\t\tq->elevator = NULL;\n\t\tq->nr_requests = q->tag_set->queue_depth;\n\t\tq->async_depth = q->tag_set->queue_depth;\n\t\treturn 0;\n\t}\n"""
+    # QUEUE_FLAG_SQ_SCHED arrived in 6.1; on 5.15 the no-elevator arm just
+    # clears q->elevator, so the counterpart drops that call.
+    blk_mq_sched_none_old_5_15 = """\tif (!e) {\n\t\tq->elevator = NULL;\n\t\tq->nr_requests = q->tag_set->queue_depth;\n\t\treturn 0;\n\t}\n"""
+    blk_mq_sched_none_new_5_15 = """\tif (!e) {\n\t\tq->elevator = NULL;\n\t\tq->nr_requests = q->tag_set->queue_depth;\n\t\tq->async_depth = q->tag_set->queue_depth;\n\t\treturn 0;\n\t}\n"""
     if "q->async_depth = q->tag_set->queue_depth;" not in blk_mq_sched_text:
-        blk_mq_sched_text = replace_once(blk_mq_sched_text, blk_mq_sched_none_old, blk_mq_sched_none_new, "feature_porting/blk_async_depth_blk_mq_sched_none")
+        if blk_mq_sched_none_old in blk_mq_sched_text:
+            blk_mq_sched_text = replace_once_blk(blk_mq_sched_text, blk_mq_sched_none_old, blk_mq_sched_none_new, "feature_porting/blk_async_depth_blk_mq_sched_none")
+        else:
+            blk_mq_sched_text = replace_once_blk(blk_mq_sched_text, blk_mq_sched_none_old_5_15, blk_mq_sched_none_new_5_15, "feature_porting/blk_async_depth_blk_mq_sched_none")
 
     blk_mq_sched_default_old = """\tq->nr_requests = 2 * min_t(unsigned int, q->tag_set->queue_depth,\n\t\t\t\t   BLKDEV_DEFAULT_RQ);\n"""
     blk_mq_sched_default_new = """\tq->nr_requests = 2 * min_t(unsigned int, q->tag_set->queue_depth,\n\t\t\t\t   BLKDEV_DEFAULT_RQ);\n\tq->async_depth = q->nr_requests;\n"""
     if "q->async_depth = q->nr_requests;" not in blk_mq_sched_text:
-        blk_mq_sched_text = replace_once(blk_mq_sched_text, blk_mq_sched_default_old, blk_mq_sched_default_new, "feature_porting/blk_async_depth_blk_mq_sched_default")
+        blk_mq_sched_text = replace_once_blk(blk_mq_sched_text, blk_mq_sched_default_old, blk_mq_sched_default_new, "feature_porting/blk_async_depth_blk_mq_sched_default")
         write_text(blk_mq_sched_c, blk_mq_sched_text)
 
     blk_sysfs_insert_anchor = """static ssize_t\nqueue_ra_store(struct request_queue *q, const char *page, size_t count)\n{\n"""
     blk_sysfs_insert_block = """static ssize_t queue_async_depth_show(struct request_queue *q, char *page)\n{\n\treturn queue_var_show(q->async_depth, page);\n}\n\nstatic ssize_t\nqueue_async_depth_store(struct request_queue *q, const char *page, size_t count)\n{\n\tunsigned long nr;\n\tint ret;\n\n\tif (!queue_is_mq(q))\n\t\treturn -EINVAL;\n\n\tret = queue_var_store(&nr, page, count);\n\tif (ret < 0)\n\t\treturn ret;\n\tif (nr == 0)\n\t\treturn -EINVAL;\n\tif (!q->elevator)\n\t\treturn -EINVAL;\n\n\tq->async_depth = min_t(unsigned long, q->nr_requests, nr);\n\tif (q->elevator->type->ops.depth_updated) {\n\t\tstruct blk_mq_hw_ctx *hctx;\n\t\tunsigned long i;\n\n\t\tqueue_for_each_hw_ctx(q, hctx, i) {\n\t\t\tif (hctx->sched_tags)\n\t\t\t\tq->elevator->type->ops.depth_updated(hctx);\n\t\t}\n\t}\n\treturn ret;\n}\n\nstatic ssize_t\nqueue_ra_store(struct request_queue *q, const char *page, size_t count)\n{\n"""
     if "static ssize_t queue_async_depth_show(struct request_queue *q, char *page)" not in blk_sysfs_text:
-        blk_sysfs_text = replace_once(blk_sysfs_text, blk_sysfs_insert_anchor, blk_sysfs_insert_block, "feature_porting/blk_async_depth_blk_sysfs_funcs")
+        blk_sysfs_text = replace_once_blk(blk_sysfs_text, blk_sysfs_insert_anchor, blk_sysfs_insert_block, "feature_porting/blk_async_depth_blk_sysfs_funcs")
 
     blk_sysfs_entry_old = """QUEUE_RW_ENTRY(queue_requests, "nr_requests");\nQUEUE_RW_ENTRY(queue_ra, "read_ahead_kb");\n"""
     blk_sysfs_entry_new = """QUEUE_RW_ENTRY(queue_requests, "nr_requests");\nQUEUE_RW_ENTRY(queue_async_depth, "async_depth");\nQUEUE_RW_ENTRY(queue_ra, "read_ahead_kb");\n"""
     if 'QUEUE_RW_ENTRY(queue_async_depth, "async_depth");' not in blk_sysfs_text:
-        blk_sysfs_text = replace_once(blk_sysfs_text, blk_sysfs_entry_old, blk_sysfs_entry_new, "feature_porting/blk_async_depth_blk_sysfs_entry")
+        blk_sysfs_text = replace_once_blk(blk_sysfs_text, blk_sysfs_entry_old, blk_sysfs_entry_new, "feature_porting/blk_async_depth_blk_sysfs_entry")
 
     blk_sysfs_attr_old = """\t&queue_requests_entry.attr,\n\t&queue_ra_entry.attr,\n"""
     blk_sysfs_attr_new = """\t&queue_requests_entry.attr,\n\t&queue_async_depth_entry.attr,\n\t&queue_ra_entry.attr,\n"""
     if "&queue_async_depth_entry.attr," not in blk_sysfs_text:
-        blk_sysfs_text = replace_once(blk_sysfs_text, blk_sysfs_attr_old, blk_sysfs_attr_new, "feature_porting/blk_async_depth_blk_sysfs_attr")
+        blk_sysfs_text = replace_once_blk(blk_sysfs_text, blk_sysfs_attr_old, blk_sysfs_attr_new, "feature_porting/blk_async_depth_blk_sysfs_attr")
         write_text(blk_sysfs_c, blk_sysfs_text)
 
     elevator_none_old = """\tret = blk_mq_init_sched(q, new_e);\n\tif (ret)\n\t\tgoto out;\n"""
     elevator_none_new = """\tret = blk_mq_init_sched(q, new_e);\n\tif (ret)\n\t\tgoto out;\n\tif (!new_e)\n\t\tq->async_depth = q->tag_set->queue_depth;\n"""
     if "if (!new_e)\n\t\tq->async_depth = q->tag_set->queue_depth;" not in elevator_text:
-        elevator_text = replace_once(elevator_text, elevator_none_old, elevator_none_new, "feature_porting/blk_async_depth_elevator_none")
+        elevator_text = replace_once_blk(elevator_text, elevator_none_old, elevator_none_new, "feature_porting/blk_async_depth_elevator_none")
         write_text(elevator_c, elevator_text)
 
     dd_helper_anchor = """/*\n * Called by __blk_mq_alloc_request(). The shallow_depth value set by this\n * function is used by __blk_mq_get_tag().\n */\n"""
     dd_helper_new = """/*\n * 'depth' is a number in the range 1..INT_MAX representing a number of\n * requests. Scale it with a factor (1 << bt->sb.shift) / q->nr_requests since\n * 1..(1 << bt->sb.shift) is the range expected by sbitmap_get_shallow().\n * Values larger than q->nr_requests have the same effect as q->nr_requests.\n */\nstatic int dd_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)\n{\n\tstruct sbitmap_queue *bt = &hctx->sched_tags->bitmap_tags;\n\tconst unsigned int nrr = hctx->queue->nr_requests;\n\n\treturn ((qdepth << bt->sb.shift) + nrr - 1) / nrr;\n}\n\n/*\n * Called by __blk_mq_alloc_request(). The shallow_depth value set by this\n * function is used by __blk_mq_get_tag().\n */\n"""
     if "static int dd_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)" not in dd_text:
-        dd_text = replace_once(dd_text, dd_helper_anchor, dd_helper_new, "feature_porting/blk_async_depth_deadline_helper")
+        dd_text = replace_once_blk(dd_text, dd_helper_anchor, dd_helper_new, "feature_porting/blk_async_depth_deadline_helper")
 
     dd_limit_old = "\tdata->shallow_depth = dd->async_depth;\n"
     dd_limit_new = "\tdata->shallow_depth = dd_to_word_depth(data->hctx, dd->async_depth);\n"
     if "dd_to_word_depth(data->hctx, dd->async_depth);" not in dd_text:
-        dd_text = replace_once(dd_text, dd_limit_old, dd_limit_new, "feature_porting/blk_async_depth_deadline_limit")
+        dd_text = replace_once_blk(dd_text, dd_limit_old, dd_limit_new, "feature_porting/blk_async_depth_deadline_limit")
 
     dd_depth_old = """\tstruct request_queue *q = hctx->queue;\n\tstruct deadline_data *dd = q->elevator->elevator_data;\n\tstruct blk_mq_tags *tags = hctx->sched_tags;\n\tunsigned int shift = tags->bitmap_tags.sb.shift;\n\n\tdd->async_depth = max(1U, 3 * (1U << shift)  / 4);\n\n\tsbitmap_queue_min_shallow_depth(&tags->bitmap_tags, dd->async_depth);\n"""
     dd_depth_new = """\tstruct request_queue *q = hctx->queue;\n\tstruct deadline_data *dd = q->elevator->elevator_data;\n\tstruct blk_mq_tags *tags = hctx->sched_tags;\n\n\tdd->async_depth = q->async_depth;\n\n\tsbitmap_queue_min_shallow_depth(&tags->bitmap_tags, 1);\n"""
     if "max(1U, 3 * (1U << shift)  / 4)" in dd_text:
-        dd_text = replace_once(dd_text, dd_depth_old, dd_depth_new, "feature_porting/blk_async_depth_deadline_depth")
+        dd_text = replace_once_blk(dd_text, dd_depth_old, dd_depth_new, "feature_porting/blk_async_depth_deadline_depth")
     elif "dd->async_depth = q->nr_requests;" in dd_text and "dd->async_depth = q->async_depth;" not in dd_text:
         dd_text = dd_text.replace("dd->async_depth = q->nr_requests;", "dd->async_depth = q->async_depth;", 1)
 
     dd_init_old = "\tq->elevator = eq;\n\treturn 0;\n"
     dd_init_new = "\tq->elevator = eq;\n\tq->async_depth = q->nr_requests;\n\treturn 0;\n"
     if "q->async_depth = q->nr_requests;" not in dd_text:
-        dd_text = replace_once(dd_text, dd_init_old, dd_init_new, "feature_porting/blk_async_depth_deadline_init")
+        dd_text = replace_once_blk(dd_text, dd_init_old, dd_init_new, "feature_porting/blk_async_depth_deadline_init")
         write_text(dd_c, dd_text)
 
     bfq_update_old = """static void bfq_update_depths(struct bfq_data *bfqd, struct sbitmap_queue *bt)\n{\n\tunsigned int depth = 1U << bt->sb.shift;\n\n\tbfqd->full_depth_shift = bt->sb.shift;\n"""
     bfq_update_new = """static void bfq_update_depths(struct bfq_data *bfqd, struct sbitmap_queue *bt)\n{\n\tunsigned int depth = bfqd->queue->async_depth;\n\n\tbfqd->full_depth_shift = bt->sb.shift;\n"""
+    # 6.1 had already factored bfq's per-word depths onto a single `depth`
+    # local, so the graft only has to redirect that local at q->async_depth.
+    # 5.15 still derives each of the four word_depths from (1U << bt->sb.shift)
+    # inline, so introduce the local and key all four off it -- preserving the
+    # 50% / 75% / ~18% / ~37% ratios bfq documents.
+    bfq_words_old_5_15 = """\tbfqd->word_depths[0][0] = max((1U << bt->sb.shift) >> 1, 1U);\n"""
+    bfq_words_new_5_15 = """\tdepth = bfqd->queue->async_depth;\n\tbfqd->word_depths[0][0] = max(depth >> 1, 1U);\n"""
+    bfq_word_scale = (
+        ("\tbfqd->word_depths[0][1] = max(((1U << bt->sb.shift) * 3) >> 2, 1U);\n",
+         "\tbfqd->word_depths[0][1] = max((depth * 3) >> 2, 1U);\n"),
+        ("\tbfqd->word_depths[1][0] = max(((1U << bt->sb.shift) * 3) >> 4, 1U);\n",
+         "\tbfqd->word_depths[1][0] = max((depth * 3) >> 4, 1U);\n"),
+        ("\tbfqd->word_depths[1][1] = max(((1U << bt->sb.shift) * 6) >> 4, 1U);\n",
+         "\tbfqd->word_depths[1][1] = max((depth * 6) >> 4, 1U);\n"),
+    )
+    bfq_decl_old_5_15 = "\tunsigned int i, j, min_shallow = UINT_MAX;\n"
+    bfq_decl_new_5_15 = "\tunsigned int i, j, min_shallow = UINT_MAX;\n\tunsigned int depth;\n"
+
     if "unsigned int depth = bfqd->queue->async_depth;" not in bfq_text and "unsigned int depth = 1U << bt->sb.shift;" in bfq_text:
-        bfq_text = replace_once(bfq_text, bfq_update_old, bfq_update_new, "feature_porting/blk_async_depth_bfq_update")
+        bfq_text = replace_once_blk(bfq_text, bfq_update_old, bfq_update_new, "feature_porting/blk_async_depth_bfq_update")
+    elif "depth = bfqd->queue->async_depth;" not in bfq_text and bfq_words_old_5_15 in bfq_text:
+        bfq_text = replace_once_blk(bfq_text, bfq_decl_old_5_15, bfq_decl_new_5_15, "feature_porting/blk_async_depth_bfq_decl")
+        bfq_text = replace_once_blk(bfq_text, bfq_words_old_5_15, bfq_words_new_5_15, "feature_porting/blk_async_depth_bfq_update")
+        for old, new in bfq_word_scale:
+            bfq_text = replace_once_blk(bfq_text, old, new, "feature_porting/blk_async_depth_bfq_word_depths")
 
     bfq_init_old = "\tbfqd->queue = q;\n"
     bfq_init_new = "\tbfqd->queue = q;\n\tq->async_depth = (q->nr_requests * 3) >> 2;\n"
     if "q->async_depth = (q->nr_requests * 3) >> 2;" not in bfq_text:
-        bfq_text = replace_once(bfq_text, bfq_init_old, bfq_init_new, "feature_porting/blk_async_depth_bfq_init")
+        bfq_text = replace_once_blk(bfq_text, bfq_init_old, bfq_init_new, "feature_porting/blk_async_depth_bfq_init")
         write_text(bfq_c, bfq_text)
 
     kyber_init_old = """\teq->elevator_data = kqd;\n\tq->elevator = eq;\n\n\treturn 0;\n}\n"""
     kyber_init_new = """\teq->elevator_data = kqd;\n\tq->elevator = eq;\n\tq->async_depth = q->nr_requests * KYBER_ASYNC_PERCENT / 100;\n\n\treturn 0;\n}\n"""
     if "q->async_depth = q->nr_requests * KYBER_ASYNC_PERCENT / 100;" not in kyber_text:
-        kyber_text = replace_once(kyber_text, kyber_init_old, kyber_init_new, "feature_porting/blk_async_depth_kyber_init")
+        kyber_text = replace_once_blk(kyber_text, kyber_init_old, kyber_init_new, "feature_porting/blk_async_depth_kyber_init")
 
     kyber_depth_old = """\tstruct kyber_queue_data *kqd = hctx->queue->elevator->elevator_data;\n\tstruct blk_mq_tags *tags = hctx->sched_tags;\n\tunsigned int shift = tags->bitmap_tags.sb.shift;\n\n\tkqd->async_depth = (1U << shift) * KYBER_ASYNC_PERCENT / 100U;\n\n\tsbitmap_queue_min_shallow_depth(&tags->bitmap_tags, kqd->async_depth);\n"""
     kyber_depth_new = """\tstruct request_queue *q = hctx->queue;\n\tstruct kyber_queue_data *kqd = q->elevator->elevator_data;\n\tstruct blk_mq_tags *tags = hctx->sched_tags;\n\n\tkqd->async_depth = q->async_depth;\n\n\tsbitmap_queue_min_shallow_depth(&tags->bitmap_tags, kqd->async_depth);\n"""
     if "kqd->async_depth = q->async_depth;" not in kyber_text and "kqd->async_depth = (1U << shift) * KYBER_ASYNC_PERCENT / 100U;" in kyber_text:
-        kyber_text = replace_once(kyber_text, kyber_depth_old, kyber_depth_new, "feature_porting/blk_async_depth_kyber_depth")
+        kyber_text = replace_once_blk(kyber_text, kyber_depth_old, kyber_depth_new, "feature_porting/blk_async_depth_kyber_depth")
     if blk_mq_text != read_text(blk_mq_c):
         write_text(blk_mq_c, blk_mq_text)
     if blk_mq_sched_text != read_text(blk_mq_sched_c):
