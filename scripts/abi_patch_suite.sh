@@ -224,6 +224,25 @@ abk_abi_patch_suite_log_target() {
   abk_log "target sublevel: $(abk_abi_patch_suite_sub_level)"
 }
 
+# Preflight for a file that only some target families ship.
+#
+# abk_require_file() calls abk_die() on a miss, which aborts setup.sh and with
+# it the whole ABK build. That is right for a file every supported tree has and
+# wrong for one an older tree legitimately lacks: the Python children already
+# degrade those capabilities to blocked_by_missing_anchor, but they never get
+# the chance if the shell preflight dies first.
+abk_abi_patch_suite_optional_file() {
+  local path="$1"
+  local reason="${2:-not present on this target}"
+
+  if [ -f "$path" ]; then
+    return 0
+  fi
+
+  abk_warn "optional target file absent, dependent capability will be skipped: $path ($reason)"
+  return 0
+}
+
 abk_abi_patch_suite_validate_display_target() {
   local common_dir
   common_dir="$(abk_abi_patch_suite_common_dir)"
@@ -436,7 +455,8 @@ abk_abi_patch_suite_apply_feature_porting() {
   abk_require_file "$common_dir/mm/slab.h"
   abk_require_file "$common_dir/mm/slub.c"
   abk_require_file "$common_dir/mm/slab_common.c"
-  abk_require_file "$common_dir/mm/swap.h"
+  abk_abi_patch_suite_optional_file "$common_dir/mm/swap.h" \
+    "internal swap header landed after 5.15; swap_table capability degrades to report-only"
   abk_require_file "$common_dir/mm/swap_state.c"
   abk_require_file "$common_dir/mm/shmem.c"
   abk_require_file "$common_dir/mm/memory.c"
@@ -460,9 +480,12 @@ abk_abi_patch_suite_apply_feature_porting_phase2() {
   output_dir="$(abk_abi_patch_suite_feature_porting_phase2_report_dir)"
   abk_abi_patch_suite_require_mainline_7012
   abk_require_file "$common_dir/io_uring/io_uring.c"
-  abk_require_file "$common_dir/io_uring/kbuf.c"
-  abk_require_file "$common_dir/io_uring/net.c"
-  abk_require_file "$common_dir/io_uring/sqpoll.c"
+  abk_abi_patch_suite_optional_file "$common_dir/io_uring/kbuf.c" \
+    "io_uring became a multi-file directory in 6.0; 5.15 ships io_uring.c plus io-wq"
+  abk_abi_patch_suite_optional_file "$common_dir/io_uring/net.c" \
+    "io_uring became a multi-file directory in 6.0; 5.15 ships io_uring.c plus io-wq"
+  abk_abi_patch_suite_optional_file "$common_dir/io_uring/sqpoll.c" \
+    "io_uring became a multi-file directory in 6.0; 5.15 ships io_uring.c plus io-wq"
   abk_require_file "$common_dir/kernel/bpf/btf.c"
   abk_require_file "$common_dir/kernel/bpf/helpers.c"
   abk_require_file "$common_dir/kernel/bpf/syscall.c"
