@@ -939,12 +939,9 @@ def main(argv: list[str]) -> int:
     ref_root = reference_root()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Files every supported tree has. A miss here is a broken checkout.
     for path in (
         current_common / "io_uring/io_uring.c",
-        current_common / "io_uring/io_uring.h",
-        current_common / "io_uring/kbuf.c",
-        current_common / "io_uring/net.c",
-        current_common / "io_uring/sqpoll.c",
         current_common / "kernel/bpf/helpers.c",
         current_common / "kernel/bpf/syscall.c",
         current_common / "kernel/bpf/verifier.c",
@@ -959,6 +956,24 @@ def main(argv: list[str]) -> int:
     ):
         if not path.exists():
             raise SystemExit(f"feature_porting_backlog: required file not found: {path}")
+
+    # io_uring became a multi-file directory in 6.0. On the older single-file
+    # layout these simply do not exist, which plan.md already treats as a
+    # property of the tree: this child must keep reporting rather than fail for
+    # want of a newer anchor. The io_uring capabilities downgrade to
+    # blocked_by_missing_anchor further down.
+    for path in (
+        current_common / "io_uring/io_uring.h",
+        current_common / "io_uring/kbuf.c",
+        current_common / "io_uring/net.c",
+        current_common / "io_uring/sqpoll.c",
+    ):
+        if not path.exists():
+            print(
+                f"::warning::feature_porting_backlog: {path} absent, this tree "
+                "predates the multi-file io_uring split; dependent io_uring "
+                "backlog items stay report-only"
+            )
 
     if not ref_root.is_dir():
         raise SystemExit(
