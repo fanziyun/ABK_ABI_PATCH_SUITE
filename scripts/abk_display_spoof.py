@@ -30,6 +30,25 @@ def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
     path.write_text(text.replace(anchor, anchor + snippet, 1))
 
 
+def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -> None:
+    """Insert after the first anchor present.
+
+    Insertion points drift between target families even when the code being
+    patched does not: fs/proc/version.c includes "internal.h" on 6.1 but not on
+    5.15. Take the first anchor that exists rather than pinning one release.
+    """
+    text = path.read_text()
+    if snippet in text:
+        return
+
+    for anchor in anchors:
+        if anchor in text:
+            path.write_text(text.replace(anchor, anchor + snippet, 1))
+            return
+
+    raise SystemExit(f"{label}: no known anchor found in {path}")
+
+
 def patch_build_utils(path: Path) -> None:
     text = path.read_text()
     os_version_block = """  BOOT_IMAGE_HEADER_VERSION=${BOOT_IMAGE_HEADER_VERSION:-3}\n  MKBOOTIMG_ARGS=(\"--header_version\" \"${BOOT_IMAGE_HEADER_VERSION}\")\n"""
@@ -290,6 +309,16 @@ static int proc_do_uts_string(struct ctl_table *table, int write,
 #endif
 """,
     ]
+
+    # 5.15 predates commit "random: add_device_randomness() on uts write", so the
+    # write-back block there has no add_device_randomness() line. Derive that
+    # shape from each candidate instead of pinning a second literal copy.
+    randomness_line = "\t\tadd_device_randomness(tmp_data, sizeof(tmp_data));\n"
+    candidates = [
+        variant
+        for candidate in candidates
+        for variant in (candidate, candidate.replace(randomness_line, "", 1))
+    ]
     replacement = f"""#ifdef CONFIG_PROC_SYSCTL
 
 static bool uts_table_is_osrelease(struct ctl_table *table)
@@ -371,6 +400,10 @@ static int proc_do_uts_string(struct ctl_table *table, int write,
 #define proc_do_uts_string NULL
 #endif
 """
+    # Keep add_device_randomness() only where the tree already called it;
+    # emitting it on 5.15 would be an implicit declaration and fail the build.
+    if randomness_line not in path.read_text():
+        replacement = replacement.replace(randomness_line, "", 1)
     replace_any(path, candidates, replacement, "kernel/utsname_sysctl.c")
 
 
@@ -381,9 +414,15 @@ def patch_proc_version(path: Path) -> None:
         "#include <generated/utsrelease.h>\n",
         "fs/proc/version.c",
     )
-    ensure_after(
+    ensure_after_any(
         path,
-        '#include "internal.h"\n\n',
+        [
+            # 6.1 carries a proc-local internal.h; 5.15 does not, and there the
+            # utsname.h include is the last one before version_proc_show().
+            '#include "internal.h"\n\n',
+            "#include <linux/utsname.h>\n\n",
+            "#include <linux/utsname.h>\n",
+        ],
         "static const char *abk_display_release_suffix(const char *release)\n"
         "{\n"
         "\twhile (*release) {\n"
