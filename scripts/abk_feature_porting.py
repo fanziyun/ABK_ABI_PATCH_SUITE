@@ -151,6 +151,20 @@ def ensure_contains(path: Path, needle: str, label: str) -> None:
         raise SystemExit(f"{label}: expected anchor missing in {path}: {needle}")
 
 
+def ensure_contains_any(path: Path, needles: list[str], label: str) -> None:
+    """Presence check that accepts any of several spellings.
+
+    A signature can gain parameters between target families without changing the
+    code a graft depends on: 6.1 threads a `struct list_lru *lru` through
+    slab_alloc_node() for memcg accounting, 5.15 does not. Pin the function, not
+    one release's parameter list.
+    """
+    text = read_text(path)
+    if any(needle in text for needle in needles):
+        return
+    raise SystemExit(f"{label}: no known anchor found in {path}")
+
+
 def optional_patch(fn, label: str, status: str = "blocked_by_missing_anchor"):
     """Run a patch whose anchors may legitimately be absent on older trees.
 
@@ -2201,7 +2215,15 @@ def patch_slab_alloc_free_hotpath(common_root: Path) -> dict[str, object]:
     original = text
     marker = "/* ABK feature_porting: slab alloc/free hotpath helper graft. */"
 
-    ensure_contains(slub_c, "static __always_inline void *slab_alloc_node(struct kmem_cache *s, struct list_lru *lru,", "feature_porting/slub_alloc")
+    ensure_contains_any(
+        slub_c,
+        [
+            # 6.1 threads a list_lru through for memcg accounting; 5.15 does not.
+            "static __always_inline void *slab_alloc_node(struct kmem_cache *s, struct list_lru *lru,",
+            "static __always_inline void *slab_alloc_node(struct kmem_cache *s,",
+        ],
+        "feature_porting/slub_alloc",
+    )
     ensure_contains(slub_c, "int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,", "feature_porting/slub_alloc_bulk")
     ensure_contains(slub_c, "void kmem_cache_free(struct kmem_cache *s, void *x)", "feature_porting/slub_free")
     ensure_contains(slub_c, "static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,", "feature_porting/slub_wipe")
@@ -2255,15 +2277,41 @@ static __always_inline void *abk_slab_next_object(struct kmem_cache *s,
     if bulk_scope != bulk_original_scope:
         text = text[:bulk_start] + bulk_scope + text[bulk_end:]
 
+    # Hoist the slab/page handle above cache_from_obj() so it is derived before
+    # `s` is reassigned. 6.1 works in struct slab (split out of struct page in
+    # 5.17) and passes a tail pointer to slab_free(); 5.15 works in struct page
+    # and has no tail parameter. Same reordering either way.
     kmem_cache_free_old = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\ttrace_kmem_cache_free(_RET_IP_, x, s);\n\tslab_free(s, virt_to_slab(x), x, NULL, &x, 1, _RET_IP_);\n}\n"""
     kmem_cache_free_new = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\tstruct slab *slab = virt_to_slab(x);\n\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\ttrace_kmem_cache_free(_RET_IP_, x, s);\n\tslab_free(s, slab, x, NULL, &x, 1, _RET_IP_);\n}\n"""
-    if kmem_cache_free_new not in text:
+    kmem_cache_free_old_5_15 = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\tslab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);\n\ttrace_kmem_cache_free(_RET_IP_, x, s->name);\n}\n"""
+    kmem_cache_free_new_5_15 = """void kmem_cache_free(struct kmem_cache *s, void *x)\n{\n\tstruct page *page = virt_to_head_page(x);\n\n\ts = cache_from_obj(s, x);\n\tif (!s)\n\t\treturn;\n\tslab_free(s, page, x, NULL, 1, _RET_IP_);\n\ttrace_kmem_cache_free(_RET_IP_, x, s->name);\n}\n"""
+    if kmem_cache_free_new in text or kmem_cache_free_new_5_15 in text:
+        pass
+    elif kmem_cache_free_old in text:
         text = replace_once(text, kmem_cache_free_old, kmem_cache_free_new, "feature_porting/slub_kmem_cache_free")
+    else:
+        text = replace_once(
+            text,
+            kmem_cache_free_old_5_15,
+            kmem_cache_free_new_5_15,
+            "feature_porting/slub_kmem_cache_free",
+        )
 
+    # 6.1 took the slab handle in two steps -- virt_to_folio() then
+    # folio_slab() -- so this collapses it to one virt_to_slab(). 5.15 predates
+    # both folios and struct slab and already reaches the handle in a single
+    # virt_to_head_page(), so there is nothing to collapse there.
     build_detached_old = """\tstruct folio *folio;\n\tsize_t same;\n\n\tobject = p[--size];\n\tfolio = virt_to_folio(object);\n\tif (!s) {\n\t\t/* Handle kalloc'ed objects */\n\t\tif (unlikely(!folio_test_slab(folio))) {\n\t\t\tfree_large_kmalloc(folio, object);\n\t\t\tdf->slab = NULL;\n\t\t\treturn size;\n\t\t}\n\t\t/* Derive kmem_cache from object */\n\t\tdf->slab = folio_slab(folio);\n\t\tdf->s = df->slab->slab_cache;\n\t} else {\n\t\tdf->slab = folio_slab(folio);\n\t\tdf->s = cache_from_obj(s, object); /* Support for memcg */\n\t}\n"""
     build_detached_new = """\tstruct slab *slab;\n\tsize_t same;\n\n\tobject = p[--size];\n\tslab = virt_to_slab(object);\n\tif (!s) {\n\t\t/* Handle kalloc'ed objects */\n\t\tif (unlikely(!slab)) {\n\t\t\tfree_large_kmalloc(virt_to_folio(object), object);\n\t\t\tdf->slab = NULL;\n\t\t\treturn size;\n\t\t}\n\t\t/* Derive kmem_cache from object */\n\t\tdf->slab = slab;\n\t\tdf->s = slab->slab_cache;\n\t} else {\n\t\tdf->slab = slab;\n\t\tdf->s = cache_from_obj(s, object); /* Support for memcg */\n\t}\n"""
-    if build_detached_new not in text:
+    if build_detached_new in text:
+        pass
+    elif build_detached_old in text:
         text = replace_once(text, build_detached_old, build_detached_new, "feature_porting/slub_build_detached_freelist")
+    else:
+        print(
+            "::warning::feature_porting/slub_build_detached_freelist: this tree "
+            "already derives the slab handle in one step, nothing to collapse"
+        )
 
     write_text(slub_c, text)
     return {
