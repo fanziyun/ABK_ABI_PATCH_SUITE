@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# Keep pre-patch bytes so a mid-run hard failure stays recoverable.
+ABK_BACKUP_SUFFIX = ".abk-orig"
+
+
 @dataclass(frozen=True)
 class PatchGroup:
     key: str
@@ -64,6 +68,9 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, text: str) -> None:
+    backup = path.with_suffix(path.suffix + ABK_BACKUP_SUFFIX)
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
     path.write_text(text)
 
 

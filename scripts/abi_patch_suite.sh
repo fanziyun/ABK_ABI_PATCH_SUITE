@@ -149,6 +149,81 @@ abk_abi_patch_suite_common_dir() {
   abk_common_dir
 }
 
+# Target family, e.g. android13-5.15 or android14-6.1.
+#
+# ABK exports ABK_BUILD_ANDROID_VERSION/ABK_BUILD_KERNEL_VERSION at both module
+# stages; outside ABK CI fall back to the tree's own Makefile.
+abk_abi_patch_suite_target_family() {
+  local android_version="${ABK_BUILD_ANDROID_VERSION:-}"
+  local kernel_version="${ABK_BUILD_KERNEL_VERSION:-}"
+
+  if [ -z "$kernel_version" ]; then
+    kernel_version="$(abk_kernel_make_value VERSION).$(abk_kernel_make_value PATCHLEVEL)"
+  fi
+
+  if [ -z "$android_version" ]; then
+    case "$kernel_version" in
+      5.10) android_version="android12" ;;
+      5.15) android_version="android13" ;;
+      6.1) android_version="android14" ;;
+      6.6) android_version="android15" ;;
+      6.12) android_version="android16" ;;
+      *) android_version="unknown" ;;
+    esac
+  fi
+
+  printf '%s-%s\n' "$android_version" "$kernel_version"
+}
+
+abk_abi_patch_suite_kernel_version() {
+  if [ -n "${ABK_BUILD_KERNEL_VERSION:-}" ]; then
+    printf '%s\n' "$ABK_BUILD_KERNEL_VERSION"
+    return 0
+  fi
+  printf '%s.%s\n' "$(abk_kernel_make_value VERSION)" "$(abk_kernel_make_value PATCHLEVEL)"
+}
+
+abk_abi_patch_suite_sub_level() {
+  if [ -n "${ABK_BUILD_SUB_LEVEL:-}" ] && [ "${ABK_BUILD_SUB_LEVEL}" != "X" ]; then
+    printf '%s\n' "$ABK_BUILD_SUB_LEVEL"
+    return 0
+  fi
+  abk_kernel_make_value SUBLEVEL
+}
+
+# True when a capability cannot exist on the target tree at all — the files or
+# types it rewrites are absent, so no anchor rewrite can recover it.
+#
+# Verified against real deprecated/android13-5.15-2024-11 (SUBLEVEL 167) source:
+#   slab_hotpath  struct slab arrived in 5.17; 5.15 SLUB is built on struct page
+#   swap_table    mm/swap.h does not exist in 5.15
+#   io_uring      5.15 io_uring/ holds only io_uring.c, io-wq.c, io-wq.h
+#   abi_bridge    5.15 has kernel/module.c, not kernel/module/{version,main}.c
+#   eevdf_logic   fair.c shape differs and vendor hooks own pick_next_entity
+abk_abi_patch_suite_capability_unportable() {
+  local capability="$1"
+  local kernel_version
+
+  kernel_version="$(abk_abi_patch_suite_kernel_version)"
+
+  case "$kernel_version" in
+    5.10|5.15)
+      case "$capability" in
+        slab_hotpath|swap_table|io_uring|abi_bridge|eevdf_logic)
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
+}
+
+abk_abi_patch_suite_log_target() {
+  abk_log "target family: $(abk_abi_patch_suite_target_family)"
+  abk_log "target sublevel: $(abk_abi_patch_suite_sub_level)"
+}
+
 abk_abi_patch_suite_validate_display_target() {
   local common_dir
   common_dir="$(abk_abi_patch_suite_common_dir)"
@@ -463,6 +538,11 @@ abk_abi_patch_suite_apply_framebuffer_bootlog() {
 }
 
 abk_abi_patch_suite_apply_abi_bridge() {
+  if abk_abi_patch_suite_capability_unportable abi_bridge; then
+    abk_warn "abi_bridge skipped on $(abk_abi_patch_suite_target_family): the loader lives in kernel/module.c, not kernel/module/{version,main}.c, so the bridge has no target to rewrite"
+    return 0
+  fi
+
   abk_abi_patch_suite_apply_dual_abi_kmi_bridge
   abk_abi_patch_suite_apply_abi_fixups
   abk_log "ABI bridge child completed: bridge preflight, loader policy, and loader-adjacent fixups"
@@ -520,6 +600,8 @@ abk_abi_patch_suite_apply_child() {
 
 abk_abi_patch_suite_apply_selected() {
   local child_id="${ABK_MODULE_CHILD_ID:-}"
+
+  abk_abi_patch_suite_log_target
 
   if [ -n "$child_id" ]; then
     abk_abi_patch_suite_apply_child "$child_id"

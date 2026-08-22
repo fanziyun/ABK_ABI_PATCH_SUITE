@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# Restoring a half-patched tree needs the pre-patch bytes: every hard failure
+# below aborts mid-run and leaves earlier files already rewritten on disk.
+ABK_BACKUP_SUFFIX = ".abk-orig"
+
+
 @dataclass(frozen=True)
 class PatchGroup:
     key: str
@@ -125,6 +130,9 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, text: str) -> None:
+    backup = path.with_suffix(path.suffix + ABK_BACKUP_SUFFIX)
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
     path.write_text(text)
 
 
@@ -141,6 +149,46 @@ def append_once(path: Path, line: str) -> None:
 def ensure_contains(path: Path, needle: str, label: str) -> None:
     if needle not in read_text(path):
         raise SystemExit(f"{label}: expected anchor missing in {path}: {needle}")
+
+
+def optional_patch(fn, label: str, status: str = "blocked_by_missing_anchor"):
+    """Run a patch whose anchors may legitimately be absent on older trees.
+
+    Mirrors ABK's own apply_susfs_optional_patch(): a missing anchor becomes a
+    warning plus a recorded status, not an aborted kernel build. Reserve this
+    for capabilities that are optional by design — a required graft that half
+    applied must still fail loudly.
+    """
+    try:
+        return fn()
+    except SystemExit as exc:
+        print(f"::warning::{label} skipped: {exc}")
+        return skipped_status(status, str(exc))
+
+
+def skipped_status(status: str, reason: str, path: Path | None = None) -> dict[str, object]:
+    """Result stand-in for a capability that was not attempted.
+
+    build_report() indexes status dicts directly, so a skip has to carry the
+    same keys a real run would. Anything the report asks for that is not listed
+    here resolves through the defaults in report_field().
+    """
+    return {
+        "status": status,
+        "skipped_reason": reason,
+        "path": str(path) if path is not None else None,
+        "phase": "skipped",
+        "next_action": f"not applicable on this tree: {reason}",
+    }
+
+
+def report_field(status: dict[str, object], key: str) -> object:
+    """Read a report field, tolerating keys a skipped capability never set."""
+    if key in status:
+        return status[key]
+    if status.get("status", "").startswith("blocked_by") or status.get("skipped_reason"):
+        return "n/a"
+    raise KeyError(key)
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -2565,6 +2613,14 @@ def collect_swap_table_phase2_large_folios_status(common_root: Path) -> dict[str
     swap_state_c = common_root / "mm/swap_state.c"
     swap_h = common_root / "mm/swap.h"
     shmem_c = common_root / "mm/shmem.c"
+
+    if not swap_h.is_file():
+        return {
+            "status": "blocked_by_layout",
+            "skipped_reason": f"{swap_h} does not exist on this tree",
+            "path": str(swap_state_c),
+        }
+
     swap_state_text = read_text(swap_state_c)
     swap_h_text = read_text(swap_h)
     shmem_text = read_text(shmem_c) if shmem_c.is_file() else ""
@@ -3090,6 +3146,17 @@ def collect_io_uring_nowait_core_status(common_root: Path) -> dict[str, object]:
     filetable_h = common_root / "io_uring/filetable.h"
     refs_h = common_root / "io_uring/refs.h"
     opdef_c = common_root / "io_uring/opdef.c"
+
+    absent = [p for p in (io_uring_c, filetable_c, filetable_h, refs_h, opdef_c)
+              if not p.is_file()]
+    if absent:
+        return {
+            "status": "blocked_by_missing_anchor",
+            "skipped_reason": "tree predates the multi-file io_uring split",
+            "missing": [str(p) for p in absent],
+            "path": str(io_uring_c),
+        }
+
     io_uring_text = read_text(io_uring_c)
     filetable_c_text = read_text(filetable_c)
     filetable_h_text = read_text(filetable_h)
@@ -3133,6 +3200,14 @@ def collect_io_uring_nowait_rw_net_status(common_root: Path) -> dict[str, object
         "statx": common_root / "io_uring/statx.c",
         "splice": common_root / "io_uring/splice.c",
     }
+    absent = [p for p in paths.values() if not p.is_file()]
+    if absent:
+        return {
+            "status": "blocked_by_missing_anchor",
+            "skipped_reason": "tree predates the multi-file io_uring split",
+            "missing": [str(p) for p in absent],
+            "path": str(paths["rw"]),
+        }
     texts = {key: read_text(path) for key, path in paths.items()}
     target_anchors = {
         "rw_nowait_helper": "static inline bool io_rw_nowait_retry_blocked(struct io_kiocb *req)" in texts["rw"],
@@ -3396,92 +3471,92 @@ def build_report(
         + "\n\n## Constraints\n\n"
         + "\n".join(f"- {item}" for item in report["constraints"])
         + "\n\n## Sched Runtime-State Status\n\n"
-        f"- State: `{sched_status['status']}`\n"
-        f"- Phase: `{sched_status['phase']}`\n"
+        f"- State: `{report_field(sched_status, 'status')}`\n"
+        f"- Phase: `{report_field(sched_status, 'phase')}`\n"
         f"- Milestones: `{sched_milestones}`\n"
-        f"- Runtime state extended: `{sched_status['runtime_state_extended']}`\n"
-        f"- Runtime state phase3 stable: `{sched_status['runtime_state_phase3_stable']}`\n"
-        f"- Slice lifecycle consistent: `{sched_status['slice_lifecycle_consistent']}`\n"
-        f"- Delayed path: `{sched_status['delayed_path_status']}`\n"
-        f"- Tree escalation required: `{sched_status['tree_escalation_required']}`\n"
-        f"- Next action: {sched_status['next_action']}\n\n"
+        f"- Runtime state extended: `{report_field(sched_status, 'runtime_state_extended')}`\n"
+        f"- Runtime state phase3 stable: `{report_field(sched_status, 'runtime_state_phase3_stable')}`\n"
+        f"- Slice lifecycle consistent: `{report_field(sched_status, 'slice_lifecycle_consistent')}`\n"
+        f"- Delayed path: `{report_field(sched_status, 'delayed_path_status')}`\n"
+        f"- Tree escalation required: `{report_field(sched_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(sched_status, 'next_action')}\n\n"
         "## PIDFD Compat Status\n\n"
-        f"- State: `{pidfd_status['status']}`\n"
-        f"- Surface: `{pidfd_status['surface_status']}`\n"
-        f"- PIDFS: `{pidfd_status['pidfs_status']}`\n"
-        f"- Surface complete: `{pidfd_status['surface_complete']}`\n"
-        f"- Next action: {pidfd_status['next_action']}\n\n"
+        f"- State: `{report_field(pidfd_status, 'status')}`\n"
+        f"- Surface: `{report_field(pidfd_status, 'surface_status')}`\n"
+        f"- PIDFS: `{report_field(pidfd_status, 'pidfs_status')}`\n"
+        f"- Surface complete: `{report_field(pidfd_status, 'surface_complete')}`\n"
+        f"- Next action: {report_field(pidfd_status, 'next_action')}\n\n"
         "## ZRAM Writeback Status\n\n"
-        f"- State: `{zram_status['status']}`\n"
-        f"- Phase: `{zram_status['phase']}`\n"
+        f"- State: `{report_field(zram_status, 'status')}`\n"
+        f"- Phase: `{report_field(zram_status, 'phase')}`\n"
         f"- Mode: `{zram_mode}`\n"
-        f"- Tree escalation required: `{zram_status['tree_escalation_required']}`\n"
-        f"- Next action: {zram_status['next_action']}\n\n"
+        f"- Tree escalation required: `{report_field(zram_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(zram_status, 'next_action')}\n\n"
         "## Swap Phase2 Status\n\n"
-        f"- State: `{swap_phase2_status['status']}`\n"
-        f"- Phase: `{swap_phase2_status['phase']}`\n"
-        f"- Target shape: `{swap_phase2_status['target_shape']}`\n"
-        f"- Folio surface used: `{swap_phase2_status['folio_surface_used']}`\n"
-        f"- Public surface retained: `{swap_phase2_status['public_surface_retained']}`\n"
-        f"- Swapcache helper grafted: `{swap_phase2_status['swapcache_helper_grafted']}`\n"
-        f"- Swap readahead simplified: `{swap_phase2_status['swap_readahead_simplified']}`\n"
-        f"- shmem escalation required: `{swap_phase2_status['shmem_escalation_required']}`\n"
-        f"- Tree escalation required: `{swap_phase2_status['tree_escalation_required']}`\n"
-        f"- Next action: {swap_phase2_status['next_action']}\n\n"
+        f"- State: `{report_field(swap_phase2_status, 'status')}`\n"
+        f"- Phase: `{report_field(swap_phase2_status, 'phase')}`\n"
+        f"- Target shape: `{report_field(swap_phase2_status, 'target_shape')}`\n"
+        f"- Folio surface used: `{report_field(swap_phase2_status, 'folio_surface_used')}`\n"
+        f"- Public surface retained: `{report_field(swap_phase2_status, 'public_surface_retained')}`\n"
+        f"- Swapcache helper grafted: `{report_field(swap_phase2_status, 'swapcache_helper_grafted')}`\n"
+        f"- Swap readahead simplified: `{report_field(swap_phase2_status, 'swap_readahead_simplified')}`\n"
+        f"- shmem escalation required: `{report_field(swap_phase2_status, 'shmem_escalation_required')}`\n"
+        f"- Tree escalation required: `{report_field(swap_phase2_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(swap_phase2_status, 'next_action')}\n\n"
         "## Slab Hotpath Status\n\n"
-        f"- State: `{slab_hotpath_status['status']}`\n"
-        f"- Phase: `{slab_hotpath_status['phase']}`\n"
-        f"- Target shape: `{slab_hotpath_status['target_shape']}`\n"
-        f"- Public surface retained: `{slab_hotpath_status['public_surface_retained']}`\n"
-        f"- Alloc path tightened: `{slab_hotpath_status['alloc_path_tightened']}`\n"
-        f"- Free path tightened: `{slab_hotpath_status['free_path_tightened']}`\n"
-        f"- Bulk path touched: `{slab_hotpath_status['bulk_path_touched']}`\n"
-        f"- Tree escalation required: `{slab_hotpath_status['tree_escalation_required']}`\n"
-        f"- Next action: {slab_hotpath_status['next_action']}\n\n"
+        f"- State: `{report_field(slab_hotpath_status, 'status')}`\n"
+        f"- Phase: `{report_field(slab_hotpath_status, 'phase')}`\n"
+        f"- Target shape: `{report_field(slab_hotpath_status, 'target_shape')}`\n"
+        f"- Public surface retained: `{report_field(slab_hotpath_status, 'public_surface_retained')}`\n"
+        f"- Alloc path tightened: `{report_field(slab_hotpath_status, 'alloc_path_tightened')}`\n"
+        f"- Free path tightened: `{report_field(slab_hotpath_status, 'free_path_tightened')}`\n"
+        f"- Bulk path touched: `{report_field(slab_hotpath_status, 'bulk_path_touched')}`\n"
+        f"- Tree escalation required: `{report_field(slab_hotpath_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(slab_hotpath_status, 'next_action')}\n\n"
         "## Hugepage Fault Fastpath Status\n\n"
-        f"- State: `{hugepage_fastpath_status['status']}`\n"
-        f"- Phase: `{hugepage_fastpath_status['phase']}`\n"
-        f"- Target shape: `{hugepage_fastpath_status['target_shape']}`\n"
-        f"- Fault alloc helper grafted: `{hugepage_fastpath_status['fault_alloc_helper_grafted']}`\n"
-        f"- Fault fallback tracked: `{hugepage_fastpath_status['fault_fallback_tracked']}`\n"
-        f"- khugepaged escalation required: `{hugepage_fastpath_status['khugepaged_escalation_required']}`\n"
-        f"- Tree escalation required: `{hugepage_fastpath_status['tree_escalation_required']}`\n"
-        f"- Next action: {hugepage_fastpath_status['next_action']}\n\n"
+        f"- State: `{report_field(hugepage_fastpath_status, 'status')}`\n"
+        f"- Phase: `{report_field(hugepage_fastpath_status, 'phase')}`\n"
+        f"- Target shape: `{report_field(hugepage_fastpath_status, 'target_shape')}`\n"
+        f"- Fault alloc helper grafted: `{report_field(hugepage_fastpath_status, 'fault_alloc_helper_grafted')}`\n"
+        f"- Fault fallback tracked: `{report_field(hugepage_fastpath_status, 'fault_fallback_tracked')}`\n"
+        f"- khugepaged escalation required: `{report_field(hugepage_fastpath_status, 'khugepaged_escalation_required')}`\n"
+        f"- Tree escalation required: `{report_field(hugepage_fastpath_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(hugepage_fastpath_status, 'next_action')}\n\n"
         "## io_uring NOWAIT Status\n\n"
-        f"- Core: `{io_uring_core_status['status']}`\n"
-        f"- Core phase: `{io_uring_core_status['phase']}`\n"
-        f"- RW/NET: `{io_uring_rw_net_status['status']}`\n"
-        f"- RW/NET phase: `{io_uring_rw_net_status['phase']}`\n"
-        f"- Support modules: `{io_uring_support_status['status']}`\n"
-        f"- Support phase: `{io_uring_support_status['phase']}`\n"
-        f"- Support counts: `{io_uring_support_status['counts']}`\n\n"
+        f"- Core: `{report_field(io_uring_core_status, 'status')}`\n"
+        f"- Core phase: `{report_field(io_uring_core_status, 'phase')}`\n"
+        f"- RW/NET: `{report_field(io_uring_rw_net_status, 'status')}`\n"
+        f"- RW/NET phase: `{report_field(io_uring_rw_net_status, 'phase')}`\n"
+        f"- Support modules: `{report_field(io_uring_support_status, 'status')}`\n"
+        f"- Support phase: `{report_field(io_uring_support_status, 'phase')}`\n"
+        f"- Support counts: `{report_field(io_uring_support_status, 'counts')}`\n\n"
         "## NOHZ Status\n\n"
-        f"- State: `{nohz_status['status']}`\n"
-        f"- Phase: `{nohz_status['phase']}`\n"
-        f"- tick_sched shape: `{nohz_status['tick_sched_shape']}`\n"
-        f"- Idle entry/exit consistent: `{nohz_status['idle_entry_exit_consistent']}`\n"
-        f"- Tick-stop consistent: `{nohz_status['tick_stop_consistent']}`\n"
-        f"- Idle-call accessor consistent: `{nohz_status['idle_calls_consistent']}`\n"
-        f"- Scope: `{nohz_status['policy_scope']}`\n"
-        f"- Tree escalation required: `{nohz_status['tree_escalation_required']}`\n"
-        f"- Next action: {nohz_status['next_action']}\n\n"
+        f"- State: `{report_field(nohz_status, 'status')}`\n"
+        f"- Phase: `{report_field(nohz_status, 'phase')}`\n"
+        f"- tick_sched shape: `{report_field(nohz_status, 'tick_sched_shape')}`\n"
+        f"- Idle entry/exit consistent: `{report_field(nohz_status, 'idle_entry_exit_consistent')}`\n"
+        f"- Tick-stop consistent: `{report_field(nohz_status, 'tick_stop_consistent')}`\n"
+        f"- Idle-call accessor consistent: `{report_field(nohz_status, 'idle_calls_consistent')}`\n"
+        f"- Scope: `{report_field(nohz_status, 'policy_scope')}`\n"
+        f"- Tree escalation required: `{report_field(nohz_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(nohz_status, 'next_action')}\n\n"
         "## AVG_IDLE Status\n\n"
-        f"- State: `{avg_idle_status['status']}`\n"
-        f"- Phase: `{avg_idle_status['phase']}`\n"
-        f"- Target shape: `{avg_idle_status['target_shape']}`\n"
-        f"- Wake avg idle retained: `{avg_idle_status['wake_avg_idle_retained']}`\n"
-        f"- SIS_PROP simplified: `{avg_idle_status['sis_prop_simplified']}`\n"
-        f"- Newidle threshold simplified: `{avg_idle_status['newidle_threshold_simplified']}`\n"
-        f"- Tree escalation required: `{avg_idle_status['tree_escalation_required']}`\n"
-        f"- Next action: {avg_idle_status['next_action']}\n\n"
+        f"- State: `{report_field(avg_idle_status, 'status')}`\n"
+        f"- Phase: `{report_field(avg_idle_status, 'phase')}`\n"
+        f"- Target shape: `{report_field(avg_idle_status, 'target_shape')}`\n"
+        f"- Wake avg idle retained: `{report_field(avg_idle_status, 'wake_avg_idle_retained')}`\n"
+        f"- SIS_PROP simplified: `{report_field(avg_idle_status, 'sis_prop_simplified')}`\n"
+        f"- Newidle threshold simplified: `{report_field(avg_idle_status, 'newidle_threshold_simplified')}`\n"
+        f"- Tree escalation required: `{report_field(avg_idle_status, 'tree_escalation_required')}`\n"
+        f"- Next action: {report_field(avg_idle_status, 'next_action')}\n\n"
         "## Hotpath Ports\n\n"
-        f"- PID: `{pid_result['group']}` / new interface scope `{pid_result['new_interface_scope']}`\n"
-        f"- FD: `{fd_result['group']}` / new interface scope `{fd_result['new_interface_scope']}`\n"
-        f"- close_range: `{close_range_result['group']}` / new interface scope `{close_range_result['new_interface_scope']}`\n"
+        f"- PID: `{report_field(pid_result, 'group')}` / new interface scope `{report_field(pid_result, 'new_interface_scope')}`\n"
+        f"- FD: `{report_field(fd_result, 'group')}` / new interface scope `{report_field(fd_result, 'new_interface_scope')}`\n"
+        f"- close_range: `{report_field(close_range_result, 'group')}` / new interface scope `{report_field(close_range_result, 'new_interface_scope')}`\n"
         "\n## Block Queue Depth\n\n"
-        f"- State: `{blk_result['status']}`\n"
-        f"- Phase: `{blk_result['phase']}`\n"
-        f"- Scope: `{blk_result['policy_scope']}`\n"
+        f"- State: `{report_field(blk_result, 'status')}`\n"
+        f"- Phase: `{report_field(blk_result, 'phase')}`\n"
+        f"- Scope: `{report_field(blk_result, 'policy_scope')}`\n"
     )
     return report
 
@@ -3545,6 +3620,7 @@ def main(argv: list[str]) -> int:
         "tree_escalation_required": False,
     }
 
+    # Files every target tree must have. A miss here is a genuinely broken tree.
     for path in (
         sched_h,
         fair_c,
@@ -3564,7 +3640,6 @@ def main(argv: list[str]) -> int:
         mm_slab_h,
         mm_slub_c,
         mm_slab_common_c,
-        mm_swap_h,
         mm_swap_state_c,
         mm_shmem_c,
         mm_memory_c,
@@ -3574,6 +3649,17 @@ def main(argv: list[str]) -> int:
         tick_sched_c,
         zram_c,
         zram_h,
+    ):
+        if not path.is_file():
+            raise SystemExit(f"feature_porting: required file not found: {path}")
+
+    # Capabilities whose target files only exist on newer trees. Absence is a
+    # property of the tree, not a broken checkout, so record and skip instead of
+    # aborting: mm/swap.h arrived with the 6.x swap rework, and io_uring only
+    # became a multi-file directory in 6.0 (5.15 ships io_uring.c plus io-wq).
+    swap_table_available = mm_swap_h.is_file()
+
+    io_uring_split_paths = (
         io_uring_core_c,
         io_uring_rw_c,
         io_uring_net_c,
@@ -3588,38 +3674,133 @@ def main(argv: list[str]) -> int:
         io_uring_filetable_h,
         io_uring_refs_h,
         io_uring_opdef_c,
-    ):
-        if not path.is_file():
-            raise SystemExit(f"feature_porting: required file not found: {path}")
+    )
+    io_uring_missing = [str(p) for p in io_uring_split_paths if not p.is_file()]
+    io_uring_available = not io_uring_missing
 
-    reference_root = _io_uring_reference_root()
-    if not reference_root.is_dir():
-        raise SystemExit(
-            f"feature_porting: 7.0.12 reference tree not found: {reference_root}. "
-            "Set ABK_MAINLINE_7012_ROOT or place a linux/ tree at the repo root."
+    if not swap_table_available:
+        print(
+            f"::warning::feature_porting: skip swap_table capability, {mm_swap_h} "
+            "does not exist on this tree"
         )
-    if not (reference_root / "Makefile").is_file():
-        raise SystemExit(
-            f"feature_porting: reference tree is missing Makefile: {reference_root}. "
-            "Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree."
+    if not io_uring_available:
+        print(
+            "::warning::feature_porting: skip io_uring capabilities, this tree "
+            f"predates the multi-file io_uring split ({len(io_uring_missing)} "
+            "target files absent)"
         )
-    io_uring_core_result = patch_io_uring_nowait_core(current_common, reference_root)
-    io_uring_rw_net_result = patch_io_uring_nowait_rw_net(current_common, reference_root)
-    io_uring_support_result = collect_io_uring_support_modules_status(current_common, reference_root)
-    sched_result = patch_sched_entity_fields(current_common)
-    sched_pick_result = patch_sched_pick_logic(current_common)
-    sched_phase3_result = patch_sched_runtime_state_phase3(current_common)
+
+
+    io_uring_skip_result = {
+        "status": "blocked_by_missing_anchor",
+        "skipped_reason": "tree predates the multi-file io_uring split",
+        "path": None,
+    }
+
+    if io_uring_available:
+        reference_root = _io_uring_reference_root()
+        if not reference_root.is_dir():
+            raise SystemExit(
+                f"feature_porting: 7.0.12 reference tree not found: {reference_root}. "
+                "Set ABK_MAINLINE_7012_ROOT or place a linux/ tree at the repo root."
+            )
+        if not (reference_root / "Makefile").is_file():
+            raise SystemExit(
+                f"feature_porting: reference tree is missing Makefile: {reference_root}. "
+                "Set ABK_MAINLINE_7012_ROOT to a checked-out 7.0.12-family linux tree."
+            )
+        io_uring_core_result = optional_patch(
+            lambda: patch_io_uring_nowait_core(current_common, reference_root),
+            "feature_porting/io_uring_nowait_core",
+        )
+        io_uring_rw_net_result = optional_patch(
+            lambda: patch_io_uring_nowait_rw_net(current_common, reference_root),
+            "feature_porting/io_uring_nowait_rw_net",
+        )
+        io_uring_support_result = collect_io_uring_support_modules_status(
+            current_common, reference_root
+        )
+    else:
+        # Without the split io_uring/ files there is nothing to graft, and the
+        # multi-GB 7.0.12 reference clone would be pure waste.
+        reference_root = None
+        io_uring_core_result = dict(io_uring_skip_result)
+        io_uring_rw_net_result = dict(io_uring_skip_result)
+        io_uring_support_result = dict(io_uring_skip_result)
+    # EEVDF is a 6.6 feature and this graft is already a forward-port onto 6.1.
+    # The sched_entity fields are only worth claiming if the fair.c logic that
+    # reads them also lands: consuming ANDROID_KABI_RESERVE slots while leaving
+    # fair.c untouched yields a tree whose scheduler declares EEVDF state that
+    # nothing maintains. Probe the logic first and skip the fields if it cannot
+    # apply. On 5.15 fair.c differs and pick_next_entity is owned by Android
+    # vendor hooks (trace_android_rvh_pick_next_entity).
+    fair_c_before = read_text(fair_c)
+    sched_pick_result = optional_patch(
+        lambda: patch_sched_pick_logic(current_common),
+        "feature_porting/sched_pick_logic",
+        status="blocked_by_layout",
+    )
+    sched_phase3_result = optional_patch(
+        lambda: patch_sched_runtime_state_phase3(current_common),
+        "feature_porting/sched_runtime_state_phase3",
+        status="blocked_by_layout",
+    )
+    eevdf_logic_landed = read_text(fair_c) != fair_c_before
+
+    if eevdf_logic_landed:
+        sched_result = patch_sched_entity_fields(current_common)
+    else:
+        print(
+            "::warning::feature_porting/sched_entity_fields skipped: the fair.c "
+            "EEVDF logic did not apply, so the KABI reserve slots are left "
+            "untouched rather than claimed for fields nothing maintains"
+        )
+        sched_result = skipped_status(
+            "blocked_by_layout",
+            "fair.c EEVDF logic unavailable on this tree; reserve slots left intact",
+            sched_h,
+        )
     pid_result = patch_pid_alloc(current_common)
     pidfd_result = patch_pidfd_preparation_compat(current_common)
     fd_result = patch_fd_alloc_hotpath(current_common)
-    close_range_result = patch_close_range_hotpath(current_common)
-    blk_patch_result = patch_blk_mq_async_depth(current_common)
+    close_range_result = optional_patch(
+        lambda: patch_close_range_hotpath(current_common),
+        "feature_porting/close_range_hotpath",
+    )
+    blk_patch_result = optional_patch(
+        lambda: patch_blk_mq_async_depth(current_common),
+        "feature_porting/blk_mq_async_depth",
+    )
     zram_patch_result = patch_zram_compressed_writeback(current_common)
     nohz_patch_result = patch_nohz_field_refinement(current_common)
-    avg_idle_patch_result = patch_avg_idle_preemption_mode(current_common)
-    swap_phase2_patch_result = patch_swap_table_phase2_large_folios(current_common)
-    slab_hotpath_patch_result = patch_slab_alloc_free_hotpath(current_common)
-    hugepage_fastpath_patch_result = patch_hugepage_fault_alloc_fastpath(current_common)
+    avg_idle_patch_result = optional_patch(
+        lambda: patch_avg_idle_preemption_mode(current_common),
+        "feature_porting/avg_idle_preemption_mode",
+    )
+    # struct slab split out of struct page in 5.17; on 5.15 SLUB is still built
+    # on struct page, so these two cannot be reached by an anchor rewrite.
+    if swap_table_available:
+        swap_phase2_patch_result = optional_patch(
+            lambda: patch_swap_table_phase2_large_folios(current_common),
+            "feature_porting/swap_table_phase2_large_folios",
+            status="blocked_by_layout",
+        )
+    else:
+        swap_phase2_patch_result = {
+            "status": "blocked_by_layout",
+            "skipped_reason": f"{mm_swap_h} does not exist on this tree",
+            "path": None,
+        }
+    slab_hotpath_patch_result = optional_patch(
+        lambda: patch_slab_alloc_free_hotpath(current_common),
+        "feature_porting/slab_alloc_free_hotpath",
+        status="blocked_by_layout",
+    )
+    hugepage_fastpath_patch_result = optional_patch(
+        lambda: patch_hugepage_fault_alloc_fastpath(current_common),
+        "feature_porting/hugepage_fault_alloc_fastpath",
+        status="blocked_by_layout",
+    )
     blk_result = collect_blk_async_depth_status(current_common)
     zram_status = collect_zram_writeback_status(current_common)
     sched_status = collect_sched_anchor_status(current_common)
@@ -3631,7 +3812,12 @@ def main(argv: list[str]) -> int:
     hugepage_fastpath_status = collect_hugepage_fault_alloc_fastpath_status(current_common)
     io_uring_core_status = collect_io_uring_nowait_core_status(current_common)
     io_uring_rw_net_status = collect_io_uring_nowait_rw_net_status(current_common)
-    io_uring_support_status = collect_io_uring_support_modules_status(current_common, reference_root)
+    if reference_root is not None:
+        io_uring_support_status = collect_io_uring_support_modules_status(
+            current_common, reference_root
+        )
+    else:
+        io_uring_support_status = dict(io_uring_skip_result)
     build_report(
         current_common,
         output_dir,
