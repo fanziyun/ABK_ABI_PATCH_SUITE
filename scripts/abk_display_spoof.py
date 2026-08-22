@@ -50,20 +50,39 @@ def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -
 
 
 def patch_build_utils(path: Path) -> None:
+    """Stamp boot-image metadata, where the build actually uses build_utils.sh.
+
+    Both blocks below only affect mkbootimg arguments -- os_version, patch level
+    and the GKI SPL date -- so neither has any bearing on the release strings the
+    kernel itself reports. build_utils.sh also differs across target families,
+    and some builders (ABK among them) never source it at all: it is referenced
+    nowhere in ABK's build.yml, which assembles boot images itself.
+
+    So a missing block here is not a failure. Warn and leave that stamp alone
+    rather than aborting a run whose kernel-side patches already applied.
+    """
     text = path.read_text()
     os_version_block = """  BOOT_IMAGE_HEADER_VERSION=${BOOT_IMAGE_HEADER_VERSION:-3}\n  MKBOOTIMG_ARGS=(\"--header_version\" \"${BOOT_IMAGE_HEADER_VERSION}\")\n"""
     os_version_new = f"""  BOOT_IMAGE_HEADER_VERSION=${{BOOT_IMAGE_HEADER_VERSION:-3}}\n  BOOT_IMAGE_OS_VERSION=${{ABK_BOOT_IMAGE_OS_VERSION:-16.0.0}}\n  BOOT_IMAGE_OS_PATCH_LEVEL=${{ABK_BOOT_IMAGE_OS_PATCH_LEVEL:-{DISPLAY_SECURITY_PATCH}}}\n  MKBOOTIMG_ARGS=(\"--header_version\" \"${{BOOT_IMAGE_HEADER_VERSION}}\")\n  MKBOOTIMG_ARGS+=(\"--os_version\" \"${{BOOT_IMAGE_OS_VERSION}}\")\n  MKBOOTIMG_ARGS+=(\"--os_patch_level\" \"${{BOOT_IMAGE_OS_PATCH_LEVEL}}\")\n"""
     if "--os_patch_level" not in text:
-        if os_version_block not in text:
-            raise SystemExit(f"build_utils.sh: expected mkbootimg header block not found in {path}")
-        text = text.replace(os_version_block, os_version_new, 1)
+        if os_version_block in text:
+            text = text.replace(os_version_block, os_version_new, 1)
+        else:
+            print(
+                "::warning::display_release_spoof: mkbootimg header block not found "
+                f"in {path}, leaving boot-image os_version/patch_level unchanged"
+            )
 
     gki_spl_old = """      local spl_date=$(printf \"%d-%02d-05\\n\" ${spl_year} ${spl_month})\n\n      gki_add_avb_footer \"${boot_image_path}\" \\\n"""
     gki_spl_new = """      local spl_date=${ABK_GKI_SPL_DATE:-$(printf \"%d-%02d-05\\n\" ${spl_year} ${spl_month})}\n\n      gki_add_avb_footer \"${boot_image_path}\" \\\n"""
     if "ABK_GKI_SPL_DATE" not in text:
-        if gki_spl_old not in text:
-            raise SystemExit(f"build_utils.sh: expected gki SPL block not found in {path}")
-        text = text.replace(gki_spl_old, gki_spl_new, 1)
+        if gki_spl_old in text:
+            text = text.replace(gki_spl_old, gki_spl_new, 1)
+        else:
+            print(
+                "::warning::display_release_spoof: gki SPL block not found in "
+                f"{path}, leaving the GKI SPL date unchanged"
+            )
 
     path.write_text(text)
 
