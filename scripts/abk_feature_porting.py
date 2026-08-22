@@ -197,6 +197,58 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+# kernel/sched/fair.c shape differences between android14-6.1 and android13-5.15.
+# All of these are renames or extra vendor-hook lines, not semantic changes, so
+# the graft itself is unaffected -- only the literals used to locate it are.
+#
+# Verified against deprecated/android13-5.15-2024-11 (SUBLEVEL 167):
+#   6.1 renamed the schedstat helpers with a _fair suffix
+#   6.1 hoisted `int action = UPDATE_TG` to the top of dequeue_entity()
+#   5.15 ends place_entity() with a trace_android_rvh_place_entity() hook
+_FAIR_5_15_RENAMES = (
+    ("update_stats_dequeue_fair(", "update_stats_dequeue("),
+    ("update_stats_wait_end_fair(", "update_stats_wait_end("),
+    ("update_stats_wait_start_fair(", "update_stats_wait_start("),
+    ("update_stats_enqueue_fair(", "update_stats_enqueue("),
+)
+_FAIR_6_1_DEQUEUE_ACTION = "{\n\tint action = UPDATE_TG;\n"
+_FAIR_5_15_PLACE_TAIL = (
+    "\t\tse->vruntime = max_vruntime(se->vruntime, vruntime);\n",
+    "\t\tse->vruntime = max_vruntime(se->vruntime, vruntime);\n"
+    "\ttrace_android_rvh_place_entity(cfs_rq, se, initial, &vruntime);\n",
+)
+
+
+def fair_shape_for_tree(text: str, snippet: str) -> str:
+    """Rewrite a fair.c literal to match the shape this tree actually uses.
+
+    Applied to both halves of each replacement, so the graft lands in the local
+    idiom instead of reintroducing 6.1 spellings the tree would fail to compile.
+    """
+    for new_name, old_name in _FAIR_5_15_RENAMES:
+        if new_name in snippet and new_name not in text and old_name in text:
+            snippet = snippet.replace(new_name, old_name)
+
+    if _FAIR_6_1_DEQUEUE_ACTION in snippet and _FAIR_6_1_DEQUEUE_ACTION not in text:
+        snippet = snippet.replace(_FAIR_6_1_DEQUEUE_ACTION, "{\n")
+
+    plain, hooked = _FAIR_5_15_PLACE_TAIL
+    if plain in snippet and hooked not in snippet and hooked in text:
+        snippet = snippet.replace(plain, hooked, 1)
+
+    return snippet
+
+
+def replace_once_fair(text: str, old: str, new: str, label: str) -> str:
+    """replace_once() that tolerates fair.c shape drift across target families."""
+    return replace_once(
+        text,
+        fair_shape_for_tree(text, old),
+        fair_shape_for_tree(text, new),
+        label,
+    )
+
+
 def replace_within(text: str, start: str, end: str, old: str, new: str, label: str) -> str:
     start_idx = text.find(start)
     if start_idx < 0:
@@ -468,7 +520,7 @@ def patch_sched_pick_logic(common_root: Path) -> dict[str, object]:
         if "\tse->min_slice = slice;\n\tse->max_slice = slice;\n" in text:
             text = text.replace("\tse->min_slice = slice;\n\tse->max_slice = slice;\n", "", 1)
         if "static void\nplace_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial);\n\nstatic void reweight_entity(" not in text:
-            text = replace_once(text, place_forward_anchor, place_forward_new, "feature_porting/fair_place_forward_backfill")
+            text = replace_once_fair(text, place_forward_anchor, place_forward_new, "feature_porting/fair_place_forward_backfill")
         if text != read_text(fair_c):
             write_text(fair_c, text)
         return {
@@ -786,60 +838,60 @@ static struct sched_entity *abk_pick_eevdf(struct cfs_rq *cfs_rq,
 \treturn best;
 }
 """
-    text = replace_once(text, helper_anchor, helper_block, "feature_porting/fair_helpers")
+    text = replace_once_fair(text, helper_anchor, helper_block, "feature_porting/fair_helpers")
 
     next_helper_old = """static struct sched_entity *__pick_next_entity(struct sched_entity *se)\n"""
     next_helper_new = """static __maybe_unused struct sched_entity *__pick_next_entity(struct sched_entity *se)\n"""
     if next_helper_old in text and next_helper_new not in text:
-        text = replace_once(text, next_helper_old, next_helper_new, "feature_porting/fair_pick_next_helper")
+        text = replace_once_fair(text, next_helper_old, next_helper_new, "feature_porting/fair_pick_next_helper")
 
     place_forward_anchor = """static inline void\ndequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }\n#endif\n\n"""
     place_forward_new = """static inline void\ndequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }\n#endif\n\nstatic void\nplace_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial);\n\n"""
     if "static void\nplace_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial);\n\nstatic void reweight_entity(" not in text:
-        text = replace_once(text, place_forward_anchor, place_forward_new, "feature_porting/fair_place_forward")
+        text = replace_once_fair(text, place_forward_anchor, place_forward_new, "feature_porting/fair_place_forward")
 
     reweight_old = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,\n\t\t\t    unsigned long weight)\n{\n\tif (se->on_rq) {\n\t\t/* commit outstanding execution time */\n\t\tif (cfs_rq->curr == se)\n\t\t\tupdate_curr(cfs_rq);\n\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);\n\t}\n\tdequeue_load_avg(cfs_rq, se);\n\n\tupdate_load_set(&se->load, weight);\n\n#ifdef CONFIG_SMP\n\tdo {\n\t\tu32 divider = get_pelt_divider(&se->avg);\n\n\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);\n\t} while (0);\n#endif\n\n\tenqueue_load_avg(cfs_rq, se);\n\tif (se->on_rq)\n\t\tupdate_load_add(&cfs_rq->load, se->load.weight);\n\n}\n"""
     reweight_new = """static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,\n\t\t\t    unsigned long weight)\n{\n\tbool curr = cfs_rq->curr == se;\n\tbool queued = se->on_rq;\n\tunsigned long old_weight = max_t(unsigned long, se->load.weight, 1UL);\n\tunsigned long new_weight = max_t(unsigned long, weight, 1UL);\n\n\tif (queued) {\n\t\t/* commit outstanding execution time before preserving lag/deadline */\n\t\tif (curr)\n\t\t\tupdate_curr(cfs_rq);\n\t\tabk_eevdf_update_lag(cfs_rq, se);\n\t\tabk_eevdf_store_rel_deadline(se);\n\t\tif (!curr)\n\t\t\t__dequeue_entity(cfs_rq, se);\n\t\tupdate_load_sub(&cfs_rq->load, se->load.weight);\n\t}\n\tdequeue_load_avg(cfs_rq, se);\n\n\tse->vlag = div_s64(se->vlag * (s64)old_weight, new_weight);\n\tabk_eevdf_scale_rel_deadline(se, old_weight, new_weight);\n\tupdate_load_set(&se->load, weight);\n\n#ifdef CONFIG_SMP\n\tdo {\n\t\tu32 divider = get_pelt_divider(&se->avg);\n\n\t\tse->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);\n\t} while (0);\n#endif\n\n\tenqueue_load_avg(cfs_rq, se);\n\tif (queued) {\n\t\tplace_entity(cfs_rq, se, 0);\n\t\tupdate_load_add(&cfs_rq->load, se->load.weight);\n\t\tif (!curr)\n\t\t\t__enqueue_entity(cfs_rq, se);\n\t}\n\n}\n"""
     if reweight_old in text:
-        text = replace_once(text, reweight_old, reweight_new, "feature_porting/fair_reweight")
+        text = replace_once_fair(text, reweight_old, reweight_new, "feature_porting/fair_reweight")
     elif reweight_new not in text:
         text = _patch_fair_reweight_compat(text, "feature_porting/fair_reweight")
 
     enqueue_old = """\tif (flags & ENQUEUE_WAKEUP)\n\t\tplace_entity(cfs_rq, se, 0);\n"""
     enqueue_new = """\tif ((flags & ENQUEUE_WAKEUP) || abk_eevdf_has_rel_deadline(se) || se->vlag)\n\t\tplace_entity(cfs_rq, se, 0);\n"""
-    text = replace_once(text, enqueue_old, enqueue_new, "feature_porting/fair_enqueue")
+    text = replace_once_fair(text, enqueue_old, enqueue_new, "feature_porting/fair_enqueue")
 
     dequeue_head_old = """static void\ndequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)\n{\n\tint action = UPDATE_TG;\n"""
     dequeue_head_new = """static void\ndequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)\n{\n\tint action = UPDATE_TG;\n\tbool sleep = flags & DEQUEUE_SLEEP;\n"""
-    text = replace_once(text, dequeue_head_old, dequeue_head_new, "feature_porting/fair_dequeue_head")
+    text = replace_once_fair(text, dequeue_head_old, dequeue_head_new, "feature_porting/fair_dequeue_head")
 
     dequeue_old = """\tupdate_stats_dequeue_fair(cfs_rq, se, flags);\n\n\tclear_buddies(cfs_rq, se);\n\n\tif (se != cfs_rq->curr)\n\t\t__dequeue_entity(cfs_rq, se);\n"""
     dequeue_new = """\tupdate_stats_dequeue_fair(cfs_rq, se, flags);\n\n\tclear_buddies(cfs_rq, se);\n\tabk_eevdf_update_lag(cfs_rq, se);\n\tif (!sleep)\n\t\tabk_eevdf_store_rel_deadline(se);\n\n\tif (se != cfs_rq->curr)\n\t\t__dequeue_entity(cfs_rq, se);\n"""
-    text = replace_once(text, dequeue_old, dequeue_new, "feature_porting/fair_dequeue")
+    text = replace_once_fair(text, dequeue_old, dequeue_new, "feature_porting/fair_dequeue")
 
     place_old = """\tif (entity_is_long_sleeper(se))\n\t\tse->vruntime = vruntime;\n\telse\n\t\tse->vruntime = max_vruntime(se->vruntime, vruntime);\n}\n"""
     place_new = """\tif (entity_is_long_sleeper(se))\n\t\tse->vruntime = vruntime;\n\telse\n\t\tse->vruntime = max_vruntime(se->vruntime, vruntime);\n\n\tabk_eevdf_place_entity(cfs_rq, se, initial);\n}\n"""
-    text = replace_once(text, place_old, place_new, "feature_porting/fair_place")
+    text = replace_once_fair(text, place_old, place_new, "feature_porting/fair_place")
 
     preempt_old = """\tse = __pick_first_entity(cfs_rq);\n\tdelta = curr->vruntime - se->vruntime;\n\n\tif (delta < 0)\n\t\treturn;\n\n\tif (delta > ideal_runtime)\n\t\tresched_curr(rq_of(cfs_rq));\n}\n"""
     preempt_new = """\tse = abk_pick_eevdf(cfs_rq, curr);\n\tif (se && se != curr && abk_eevdf_entity_before(se, curr)) {\n\t\tresched_curr(rq_of(cfs_rq));\n\t\treturn;\n\t}\n\n\tse = __pick_first_entity(cfs_rq);\n\tdelta = curr->vruntime - se->vruntime;\n\n\tif (delta < 0)\n\t\treturn;\n\n\tif (delta > ideal_runtime)\n\t\tresched_curr(rq_of(cfs_rq));\n}\n"""
-    text = replace_once(text, preempt_old, preempt_new, "feature_porting/fair_preempt")
+    text = replace_once_fair(text, preempt_old, preempt_new, "feature_porting/fair_preempt")
 
     set_next_old = """\t\tupdate_stats_wait_end_fair(cfs_rq, se);\n\t\t__dequeue_entity(cfs_rq, se);\n\t\tupdate_load_avg(cfs_rq, se, UPDATE_TG);\n"""
     set_next_new = """\t\tupdate_stats_wait_end_fair(cfs_rq, se);\n\t\tabk_eevdf_refresh_deadline(cfs_rq, se);\n\t\tabk_eevdf_update_lag(cfs_rq, se);\n\t\t__dequeue_entity(cfs_rq, se);\n\t\tupdate_load_avg(cfs_rq, se, UPDATE_TG);\n"""
-    text = replace_once(text, set_next_old, set_next_new, "feature_porting/fair_set_next")
+    text = replace_once_fair(text, set_next_old, set_next_new, "feature_porting/fair_set_next")
 
     pick_old = """static struct sched_entity *\npick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)\n{\n\tstruct sched_entity *left = __pick_first_entity(cfs_rq);\n\tstruct sched_entity *se = NULL;\n\n\ttrace_android_rvh_pick_next_entity(cfs_rq, curr, &se);\n\tif (se)\n\t\tgoto done;\n\n\t/*\n\t * If curr is set we have to see if its left of the leftmost entity\n\t * still in the tree, provided there was anything in the tree at all.\n\t */\n\tif (!left || (curr && entity_before(curr, left)))\n\t\tleft = curr;\n\n\tse = left; /* ideally we run the leftmost entity */\n\n\t/*\n\t * Avoid running the skip buddy, if running something else can\n\t * be done without getting too unfair.\n\t */\n\tif (cfs_rq->skip && cfs_rq->skip == se) {\n\t\tstruct sched_entity *second;\n\n\t\tif (se == curr) {\n\t\t\tsecond = __pick_first_entity(cfs_rq);\n\t\t} else {\n\t\t\tsecond = __pick_next_entity(se);\n\t\t\tif (!second || (curr && entity_before(curr, second)))\n\t\t\t\tsecond = curr;\n\t\t}\n\n\t\tif (second && wakeup_preempt_entity(second, left) < 1)\n\t\t\tse = second;\n\t}\n\n\tif (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, left) < 1) {\n\t\t/*\n\t\t * Someone really wants this to run. If it's not unfair, run it.\n\t\t */\n\t\tse = cfs_rq->next;\n\t} else if (cfs_rq->last && wakeup_preempt_entity(cfs_rq->last, left) < 1) {\n\t\t/*\n\t\t * Prefer last buddy, try to return the CPU to a preempted task.\n\t\t */\n\t\tse = cfs_rq->last;\n\t}\n\ndone:\n\treturn se;\n}\n"""
     pick_new = """static struct sched_entity *\npick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)\n{\n\tstruct sched_entity *se = NULL;\n\n\ttrace_android_rvh_pick_next_entity(cfs_rq, curr, &se);\n\tif (se)\n\t\treturn se;\n\n\treturn abk_pick_eevdf(cfs_rq, curr);\n}\n"""
-    text = replace_once(text, pick_old, pick_new, "feature_porting/fair_pick")
+    text = replace_once_fair(text, pick_old, pick_new, "feature_porting/fair_pick")
 
     put_prev_old = """\tif (prev->on_rq) {\n\t\tupdate_stats_wait_start_fair(cfs_rq, prev);\n\t\t/* Put 'current' back into the tree. */\n\t\t__enqueue_entity(cfs_rq, prev);\n\t\t/* in !on_rq case, update occurred at dequeue */\n\t\tupdate_load_avg(cfs_rq, prev, 0);\n\t}\n"""
     put_prev_new = """\tif (prev->on_rq) {\n\t\tupdate_stats_wait_start_fair(cfs_rq, prev);\n\t\tabk_eevdf_refresh_deadline(cfs_rq, prev);\n\t\tabk_eevdf_update_lag(cfs_rq, prev);\n\t\t/* Put 'current' back into the tree. */\n\t\t__enqueue_entity(cfs_rq, prev);\n\t\t/* in !on_rq case, update occurred at dequeue */\n\t\tupdate_load_avg(cfs_rq, prev, 0);\n\t}\n"""
-    text = replace_once(text, put_prev_old, put_prev_new, "feature_porting/fair_put_prev")
+    text = replace_once_fair(text, put_prev_old, put_prev_new, "feature_porting/fair_put_prev")
 
     tick_old = """\tif (cfs_rq->nr_running > 1)\n\t\tcheck_preempt_tick(cfs_rq, curr);\n\ttrace_android_rvh_entity_tick(cfs_rq, curr);\n}\n"""
     tick_new = """\tif (abk_eevdf_refresh_deadline(cfs_rq, curr)) {\n\t\tclear_buddies(cfs_rq, curr);\n\t\tresched_curr(rq_of(cfs_rq));\n\t}\n\tabk_eevdf_update_lag(cfs_rq, curr);\n\n\tif (cfs_rq->nr_running > 1)\n\t\tcheck_preempt_tick(cfs_rq, curr);\n\ttrace_android_rvh_entity_tick(cfs_rq, curr);\n}\n"""
-    text = replace_once(text, tick_old, tick_new, "feature_porting/fair_tick")
+    text = replace_once_fair(text, tick_old, tick_new, "feature_porting/fair_tick")
 
     write_text(fair_c, text)
     return {
@@ -890,7 +942,7 @@ def patch_sched_runtime_state_phase3(common_root: Path) -> dict[str, object]:
     reweight_anchor = """\tif (queued) {\n\t\t/* commit outstanding execution time before preserving lag/deadline */\n"""
     reweight_new = """\tif (queued) {\n\t\t/* ABK feature_porting: phase-3 preserve lag/deadline across both current and queued reweight paths. */\n\t\t/* commit outstanding execution time before preserving lag/deadline */\n"""
     if reweight_phase3_marker not in text:
-        text = replace_once(text, reweight_anchor, reweight_new, "feature_porting/fair_phase3_reweight_marker")
+        text = replace_once_fair(text, reweight_anchor, reweight_new, "feature_porting/fair_phase3_reweight_marker")
 
     if text != original:
         write_text(fair_c, text)
