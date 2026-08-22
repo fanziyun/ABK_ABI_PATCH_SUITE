@@ -1,6 +1,17 @@
 # ABK ABI Patch Suite
 
-`ABK_ABI_PATCH_SUITE` is a single `module_set` for Android 14 / Linux 6.1.118 kernels.
+`ABK_ABI_PATCH_SUITE` is a single `module_set` for Android GKI kernels.
+
+Target families:
+
+- `android14-6.1` — the family the suite was written against
+- `android13-5.15` — supported as of the 5.15 support line; capabilities whose
+  target types or files arrived after 5.15 degrade to report-only rather than
+  failing the build
+
+The suite reads `ABK_BUILD_ANDROID_VERSION` / `ABK_BUILD_KERNEL_VERSION` /
+`ABK_BUILD_SUB_LEVEL`, which ABK exports at both module stages, and falls back
+to the tree's own `Makefile` outside ABK CI.
 
 Public child ids:
 
@@ -128,11 +139,11 @@ Optional clone-control env:
 Remote injection examples:
 
 ```text
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#display_release_spoof;after_patch
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#abi_bridge;after_patch
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#security_backport;after_patch
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#feature_porting_core;after_patch
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#feature_porting_backlog;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#display_release_spoof;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#abi_bridge;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#security_backport;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#feature_porting_core;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#feature_porting_backlog;after_patch
 ```
 
 If no child id is provided, the module set still defaults to `display_release_spoof`.
@@ -165,7 +176,7 @@ bash ABK_ABI_PATCH_SUITE/tests/build_bridge_test_ko.sh "$ABK_MAINLINE_7012_ROOT"
 This module set is intended to be injected by `abk` kernel build workflows through:
 
 ```text
-set:https://github.com/xingguangcuican6666/ABK_ABI_PATCH_SUITE.git#<child>;after_patch
+set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#<child>;after_patch
 ```
 
 Inside `abk` CI, `setup.sh` now adapts to that environment directly:
