@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+ABK_BACKUP_SUFFIX = ".abk-orig"
+
 SOURCE_BASE = "7.0.12-first"
 ALLOWED_APPLY_MODES = {
     "scoped helper graft",
@@ -39,6 +41,13 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, text: str) -> None:
+    # Snapshot the original bytes once, so a run that hard-fails part-way can be
+    # rolled back with abk_rollback.sh. Skip it when the file does not exist yet:
+    # report output is created here, and there is nothing to restore.
+    if path.exists():
+        backup = path.with_suffix(path.suffix + ABK_BACKUP_SUFFIX)
+        if not backup.exists():
+            backup.write_bytes(path.read_bytes())
     path.write_text(text)
 
 

@@ -169,17 +169,40 @@ def ensure_contains_any(path: Path, needles: list[str], label: str) -> None:
     raise SystemExit(f"{label}: no known anchor found in {path}")
 
 
-def optional_patch(fn, label: str, status: str = "blocked_by_missing_anchor"):
+def optional_patch(fn, label: str, status: str = "blocked_by_missing_anchor",
+                   guards: list[Path] | None = None):
     """Run a patch whose anchors may legitimately be absent on older trees.
 
     Mirrors ABK's own apply_susfs_optional_patch(): a missing anchor becomes a
     warning plus a recorded status, not an aborted kernel build. Reserve this
     for capabilities that are optional by design — a required graft that half
     applied must still fail loudly.
+
+    Which is why `guards` exists. Several of these patches rewrite one file,
+    then another, then hit an anchor in a third; swallowing that exit would
+    report a clean skip over a tree where the first two files are already
+    changed. Pass the files a patch writes and a partial application is
+    re-raised instead of being downgraded.
     """
+    before = {}
+    for path in guards or ():
+        if path.is_file():
+            before[path] = path.read_bytes()
+
     try:
         return fn()
     except SystemExit as exc:
+        touched = sorted(
+            str(path) for path, original in before.items()
+            if not path.is_file() or path.read_bytes() != original
+        )
+        if touched:
+            raise SystemExit(
+                f"{label}: anchor missing after {len(touched)} file(s) were already "
+                f"rewritten, so the tree is half-patched and cannot be skipped "
+                f"cleanly: {exc}. Rewritten: {', '.join(touched)}. "
+                f"Restore with scripts/abk_rollback.sh <kernel-common-dir> --apply"
+            ) from exc
         print(f"::warning::{label} skipped: {exc}")
         return skipped_status(status, str(exc))
 
@@ -2237,9 +2260,11 @@ def patch_avg_idle_preemption_mode(common_root: Path) -> dict[str, object]:
     if "rq->wake_avg_idle = rq->avg_idle;" in core_text:
         core_text = replace_once(core_text, init_old, init_new, "feature_porting/avg_idle_init")
 
-    if "sched_feat(SIS_PROP) && !has_idle_core" in fair_text:
-        select_old = """/*\n * Scan the LLC domain for idle CPUs; this is dynamically regulated by\n * comparing the average scan cost (tracked in sd->avg_scan_cost) against the\n * average idle time for this rq (as found in rq->avg_idle).\n */\nstatic int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)\n{\n\tstruct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);\n\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n\tstruct sched_domain_shared *sd_share;\n\tstruct rq *this_rq = this_rq();\n\tint this = smp_processor_id();\n\tstruct sched_domain *this_sd = NULL;\n\tu64 time = 0;\n\n\tcpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);\n\n\tif (sched_feat(SIS_PROP) && !has_idle_core) {\n\t\tu64 avg_cost, avg_idle, span_avg;\n\t\tunsigned long now = jiffies;\n\n\t\tthis_sd = rcu_dereference(*this_cpu_ptr(&sd_llc));\n\t\tif (!this_sd)\n\t\t\treturn -1;\n\n\t\t/*\n\t\t * If we're busy, the assumption that the last idle period\n\t\t * predicts the future is flawed; age away the remaining\n\t\t * predicted idle time.\n\t\t */\n\t\tif (unlikely(this_rq->wake_stamp < now)) {\n\t\t\twhile (this_rq->wake_stamp < now && this_rq->wake_avg_idle) {\n\t\t\t\tthis_rq->wake_stamp++;\n\t\t\t\tthis_rq->wake_avg_idle >>= 1;\n\t\t\t}\n\t\t}\n\n\t\tavg_idle = this_rq->wake_avg_idle;\n\t\tavg_cost = this_sd->avg_scan_cost + 1;\n\n\t\tspan_avg = sd->span_weight * avg_idle;\n\t\tif (span_avg > 4*avg_cost)\n\t\t\tnr = div_u64(span_avg, avg_cost);\n\t\telse\n\t\t\tnr = 4;\n\n\t\ttime = cpu_clock(this);\n\t}\n\n\tif (sched_feat(SIS_UTIL)) {\n\t\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, target));\n\t\tif (sd_share) {\n\t\t\t/* because !--nr is the condition to stop scan */\n\t\t\tnr = READ_ONCE(sd_share->nr_idle_scan) + 1;\n\t\t\t/* overloaded LLC is unlikely to have idle cpu/core */\n\t\t\tif (nr == 1)\n\t\t\t\treturn -1;\n\t\t}\n\t}\n\n\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n\t\tif (has_idle_core) {\n\t\t\ti = select_idle_core(p, cpu, cpus, &idle_cpu);\n\t\t\tif ((unsigned int)i < nr_cpumask_bits)\n\t\t\t\treturn i;\n\n\t\t} else {\n\t\t\tif (!--nr)\n\t\t\t\treturn -1;\n\t\t\tidle_cpu = __select_idle_cpu(cpu, p);\n\t\t\tif ((unsigned int)idle_cpu < nr_cpumask_bits)\n\t\t\t\tbreak;\n\t\t}\n\t}\n\n\tif (has_idle_core)\n\t\tset_idle_cores(target, false);\n\n\tif (sched_feat(SIS_PROP) && this_sd && !has_idle_core) {\n\t\ttime = cpu_clock(this) - time;\n\n\t\t/*\n\t\t * Account for the scan cost of wakeups against the average\n\t\t * idle time.\n\t\t */\n\t\tthis_rq->wake_avg_idle -= min(this_rq->wake_avg_idle, time);\n\n\t\tupdate_avg(&this_sd->avg_scan_cost, time);\n\t}\n\n\treturn idle_cpu;\n}\n"""
-        select_new = """/*\n * ABK feature_porting: avg_idle preemption mode simplification.\n * Scan the LLC domain for idle CPUs; this tree keeps the SIS_UTIL shared\n * LLC scan cap and drops the wake_avg_idle/SIS_PROP prediction path.\n */\nstatic int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)\n{\n\tstruct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);\n\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n\tstruct sched_domain_shared *sd_share;\n\n\tcpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);\n\n\tif (sched_feat(SIS_UTIL)) {\n\t\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, target));\n\t\tif (sd_share) {\n\t\t\t/* because !--nr is the condition to stop scan */\n\t\t\tnr = READ_ONCE(sd_share->nr_idle_scan) + 1;\n\t\t\t/* overloaded LLC is unlikely to have idle cpu/core */\n\t\t\tif (nr == 1)\n\t\t\t\treturn -1;\n\t\t}\n\t}\n\n\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n\t\tif (has_idle_core) {\n\t\t\ti = select_idle_core(p, cpu, cpus, &idle_cpu);\n\t\t\tif ((unsigned int)i < nr_cpumask_bits)\n\t\t\t\treturn i;\n\n\t\t} else {\n\t\t\tif (--nr <= 0)\n\t\t\t\treturn -1;\n\t\t\tidle_cpu = __select_idle_cpu(cpu, p);\n\t\t\tif ((unsigned int)idle_cpu < nr_cpumask_bits)\n\t\t\t\tbreak;\n\t\t}\n\t}\n\n\tif (has_idle_core)\n\t\tset_idle_cores(target, false);\n\n\treturn idle_cpu;\n}\n"""
+    # Bound unconditionally: the dispatch below runs on a tree that may already
+    # carry the graft, and on 6.1 that tree no longer contains the SIS_PROP arms
+    # these literals are keyed to.
+    select_old = """/*\n * Scan the LLC domain for idle CPUs; this is dynamically regulated by\n * comparing the average scan cost (tracked in sd->avg_scan_cost) against the\n * average idle time for this rq (as found in rq->avg_idle).\n */\nstatic int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)\n{\n\tstruct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);\n\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n\tstruct sched_domain_shared *sd_share;\n\tstruct rq *this_rq = this_rq();\n\tint this = smp_processor_id();\n\tstruct sched_domain *this_sd = NULL;\n\tu64 time = 0;\n\n\tcpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);\n\n\tif (sched_feat(SIS_PROP) && !has_idle_core) {\n\t\tu64 avg_cost, avg_idle, span_avg;\n\t\tunsigned long now = jiffies;\n\n\t\tthis_sd = rcu_dereference(*this_cpu_ptr(&sd_llc));\n\t\tif (!this_sd)\n\t\t\treturn -1;\n\n\t\t/*\n\t\t * If we're busy, the assumption that the last idle period\n\t\t * predicts the future is flawed; age away the remaining\n\t\t * predicted idle time.\n\t\t */\n\t\tif (unlikely(this_rq->wake_stamp < now)) {\n\t\t\twhile (this_rq->wake_stamp < now && this_rq->wake_avg_idle) {\n\t\t\t\tthis_rq->wake_stamp++;\n\t\t\t\tthis_rq->wake_avg_idle >>= 1;\n\t\t\t}\n\t\t}\n\n\t\tavg_idle = this_rq->wake_avg_idle;\n\t\tavg_cost = this_sd->avg_scan_cost + 1;\n\n\t\tspan_avg = sd->span_weight * avg_idle;\n\t\tif (span_avg > 4*avg_cost)\n\t\t\tnr = div_u64(span_avg, avg_cost);\n\t\telse\n\t\t\tnr = 4;\n\n\t\ttime = cpu_clock(this);\n\t}\n\n\tif (sched_feat(SIS_UTIL)) {\n\t\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, target));\n\t\tif (sd_share) {\n\t\t\t/* because !--nr is the condition to stop scan */\n\t\t\tnr = READ_ONCE(sd_share->nr_idle_scan) + 1;\n\t\t\t/* overloaded LLC is unlikely to have idle cpu/core */\n\t\t\tif (nr == 1)\n\t\t\t\treturn -1;\n\t\t}\n\t}\n\n\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n\t\tif (has_idle_core) {\n\t\t\ti = select_idle_core(p, cpu, cpus, &idle_cpu);\n\t\t\tif ((unsigned int)i < nr_cpumask_bits)\n\t\t\t\treturn i;\n\n\t\t} else {\n\t\t\tif (!--nr)\n\t\t\t\treturn -1;\n\t\t\tidle_cpu = __select_idle_cpu(cpu, p);\n\t\t\tif ((unsigned int)idle_cpu < nr_cpumask_bits)\n\t\t\t\tbreak;\n\t\t}\n\t}\n\n\tif (has_idle_core)\n\t\tset_idle_cores(target, false);\n\n\tif (sched_feat(SIS_PROP) && this_sd && !has_idle_core) {\n\t\ttime = cpu_clock(this) - time;\n\n\t\t/*\n\t\t * Account for the scan cost of wakeups against the average\n\t\t * idle time.\n\t\t */\n\t\tthis_rq->wake_avg_idle -= min(this_rq->wake_avg_idle, time);\n\n\t\tupdate_avg(&this_sd->avg_scan_cost, time);\n\t}\n\n\treturn idle_cpu;\n}\n"""
+    select_new = """/*\n * ABK feature_porting: avg_idle preemption mode simplification.\n * Scan the LLC domain for idle CPUs; this tree keeps the SIS_UTIL shared\n * LLC scan cap and drops the wake_avg_idle/SIS_PROP prediction path.\n */\nstatic int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)\n{\n\tstruct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);\n\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n\tstruct sched_domain_shared *sd_share;\n\n\tcpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);\n\n\tif (sched_feat(SIS_UTIL)) {\n\t\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, target));\n\t\tif (sd_share) {\n\t\t\t/* because !--nr is the condition to stop scan */\n\t\t\tnr = READ_ONCE(sd_share->nr_idle_scan) + 1;\n\t\t\t/* overloaded LLC is unlikely to have idle cpu/core */\n\t\t\tif (nr == 1)\n\t\t\t\treturn -1;\n\t\t}\n\t}\n\n\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n\t\tif (has_idle_core) {\n\t\t\ti = select_idle_core(p, cpu, cpus, &idle_cpu);\n\t\t\tif ((unsigned int)i < nr_cpumask_bits)\n\t\t\t\treturn i;\n\n\t\t} else {\n\t\t\tif (--nr <= 0)\n\t\t\t\treturn -1;\n\t\t\tidle_cpu = __select_idle_cpu(cpu, p);\n\t\t\tif ((unsigned int)idle_cpu < nr_cpumask_bits)\n\t\t\t\tbreak;\n\t\t}\n\t}\n\n\tif (has_idle_core)\n\t\tset_idle_cores(target, false);\n\n\treturn idle_cpu;\n}\n"""
     # The point of this graft is to stop maintaining rq->wake_avg_idle -- the
     # SIS_PROP scan-cost prediction -- and cap the idle scan some cheaper way.
     #
@@ -2260,9 +2285,14 @@ def patch_avg_idle_preemption_mode(common_root: Path) -> dict[str, object]:
     select_tail_old_5_15 = """\tif (sched_feat(SIS_PROP) && !has_idle_core) {\n\t\ttime = cpu_clock(this) - time;\n\n\t\t/*\n\t\t * Account for the scan cost of wakeups against the average\n\t\t * idle time.\n\t\t */\n\t\tthis_rq->wake_avg_idle -= min(this_rq->wake_avg_idle, time);\n\n\t\tupdate_avg(&this_sd->avg_scan_cost, time);\n\t}\n"""
     select_tail_new_5_15 = """\tif (sched_feat(SIS_PROP) && !has_idle_core) {\n\t\ttime = cpu_clock(this) - time;\n\n\t\tupdate_avg(&this_sd->avg_scan_cost, time);\n\t}\n"""
 
-    if "sched_feat(SIS_UTIL)" in fair_text:
+    # Dispatch on what the tree still has, so a re-run is a no-op rather than a
+    # failure. Both forms retire rq->wake_avg_idle, so its absence from
+    # select_idle_cpu() is what "already applied" looks like on either family.
+    if "this_rq->wake_avg_idle" not in fair_text:
+        pass
+    elif "sched_feat(SIS_UTIL)" in fair_text:
         fair_text = replace_once(fair_text, select_old, select_new, "feature_porting/avg_idle_select_idle_cpu")
-    elif "this_rq->wake_avg_idle" in fair_text:
+    else:
         fair_text = replace_once(fair_text, select_old_5_15, select_new_5_15, "feature_porting/avg_idle_select_idle_cpu")
         fair_text = replace_once(fair_text, select_tail_old_5_15, select_tail_new_5_15, "feature_porting/avg_idle_select_idle_cpu_tail")
 
@@ -2519,10 +2549,19 @@ static __always_inline void *abk_slab_next_object(struct kmem_cache *s,
         pass
     elif build_detached_old in text:
         text = replace_once(text, build_detached_old, build_detached_new, "feature_porting/slub_build_detached_freelist")
-    else:
+    elif "struct folio" not in text:
+        # A tree with no folios at all cannot have the two-step lookup, so there
+        # is genuinely nothing to collapse. Keyed on that rather than on "the
+        # anchor missed", which would also swallow 6.1 anchor drift.
         print(
             "::warning::feature_porting/slub_build_detached_freelist: this tree "
-            "already derives the slab handle in one step, nothing to collapse"
+            "predates folios and already derives the slab handle in one step, "
+            "nothing to collapse"
+        )
+    else:
+        raise SystemExit(
+            "feature_porting/slub_build_detached_freelist: expected block missing "
+            "on a folio-aware tree"
         )
 
     write_text(slub_c, text)
@@ -3911,7 +3950,11 @@ def main(argv: list[str]) -> int:
     file_c = current_common / "fs/file.c"
     tick_h = current_common / "include/linux/tick.h"
     sched_nohz_h = current_common / "include/linux/sched/nohz.h"
+    blkdev_h = current_common / "include/linux/blkdev.h"
+    blk_core_c = current_common / "block/blk-core.c"
     blk_mq_c = current_common / "block/blk-mq.c"
+    blk_mq_sched_c = current_common / "block/blk-mq-sched.c"
+    elevator_c = current_common / "block/elevator.c"
     blk_sysfs_c = current_common / "block/blk-sysfs.c"
     dd_c = current_common / "block/mq-deadline.c"
     bfq_c = current_common / "block/bfq-iosched.c"
@@ -3930,6 +3973,17 @@ def main(argv: list[str]) -> int:
     zram_c = current_common / "drivers/block/zram/zram_drv.c"
     zram_h = current_common / "drivers/block/zram/zram_drv.h"
     io_uring_root = current_common / "io_uring"
+    # The two io_uring grafts each rewrite several files in sequence, so give
+    # optional_patch() the list to notice a partial application.
+    io_uring_core_files = [
+        io_uring_root / name for name in
+        ("io_uring.c", "filetable.c", "filetable.h", "refs.h", "opdef.c")
+    ]
+    io_uring_rw_net_files = [
+        io_uring_root / name for name in
+        ("rw.c", "net.c", "poll.c", "openclose.c", "splice.c", "statx.c",
+         "sync.c", "xattr.c", "fs.c")
+    ]
     io_uring_core_c = io_uring_root / "io_uring.c"
     io_uring_rw_c = io_uring_root / "rw.c"
     io_uring_net_c = io_uring_root / "net.c"
@@ -4044,10 +4098,12 @@ def main(argv: list[str]) -> int:
         io_uring_core_result = optional_patch(
             lambda: patch_io_uring_nowait_core(current_common, reference_root),
             "feature_porting/io_uring_nowait_core",
+            guards=io_uring_core_files,
         )
         io_uring_rw_net_result = optional_patch(
             lambda: patch_io_uring_nowait_rw_net(current_common, reference_root),
             "feature_porting/io_uring_nowait_rw_net",
+            guards=io_uring_rw_net_files,
         )
         io_uring_support_result = collect_io_uring_support_modules_status(
             current_common, reference_root
@@ -4066,18 +4122,24 @@ def main(argv: list[str]) -> int:
     # nothing maintains. Probe the logic first and skip the fields if it cannot
     # apply. On 5.15 fair.c differs and pick_next_entity is owned by Android
     # vendor hooks (trace_android_rvh_pick_next_entity).
-    fair_c_before = read_text(fair_c)
     sched_pick_result = optional_patch(
         lambda: patch_sched_pick_logic(current_common),
         "feature_porting/sched_pick_logic",
         status="blocked_by_layout",
+        guards=[fair_c],
     )
     sched_phase3_result = optional_patch(
         lambda: patch_sched_runtime_state_phase3(current_common),
         "feature_porting/sched_runtime_state_phase3",
         status="blocked_by_layout",
+        guards=[fair_c],
     )
-    eevdf_logic_landed = read_text(fair_c) != fair_c_before
+    # Test the tree, not this run. "fair.c changed just now" is the wrong
+    # question: a resumed or re-run build hands us a fair.c that already carries
+    # the graft, and skipping then would leave fair.c reading se->vlag/slice/
+    # deadline while sched.h still has bare ANDROID_KABI_RESERVE slots -- a tree
+    # that does not compile. patch_sched_entity_fields() is itself idempotent.
+    eevdf_logic_landed = "abk_eevdf_" in read_text(fair_c)
 
     if eevdf_logic_landed:
         sched_result = patch_sched_entity_fields(current_common)
@@ -4102,12 +4164,15 @@ def main(argv: list[str]) -> int:
     blk_patch_result = optional_patch(
         lambda: patch_blk_mq_async_depth(current_common),
         "feature_porting/blk_mq_async_depth",
+        guards=[blkdev_h, blk_core_c, blk_mq_c, blk_mq_sched_c, blk_sysfs_c,
+                elevator_c, dd_c, bfq_c, kyber_c],
     )
     zram_patch_result = patch_zram_compressed_writeback(current_common)
     nohz_patch_result = patch_nohz_field_refinement(current_common)
     avg_idle_patch_result = optional_patch(
         lambda: patch_avg_idle_preemption_mode(current_common),
         "feature_porting/avg_idle_preemption_mode",
+        guards=[fair_c, core_sched_c, idle_c, internal_sched_h],
     )
     # struct slab split out of struct page in 5.17; on 5.15 SLUB is still built
     # on struct page, so these two cannot be reached by an anchor rewrite.
@@ -4116,6 +4181,7 @@ def main(argv: list[str]) -> int:
             lambda: patch_swap_table_phase2_large_folios(current_common),
             "feature_porting/swap_table_phase2_large_folios",
             status="blocked_by_layout",
+            guards=[mm_swap_h, mm_swap_state_c],
         )
     else:
         swap_phase2_patch_result = {
@@ -4132,6 +4198,7 @@ def main(argv: list[str]) -> int:
         lambda: patch_hugepage_fault_alloc_fastpath(current_common),
         "feature_porting/hugepage_fault_alloc_fastpath",
         status="blocked_by_layout",
+        guards=[mm_huge_memory_c, mm_memory_c],
     )
     blk_result = collect_blk_async_depth_status(current_common)
     zram_status = collect_zram_writeback_status(current_common)

@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
+
+
+def _abk_common():
+    """Load abk_common from this script's directory.
+
+    ABK runs each child as `python3 .../scripts/abk_child.py`, so a plain import
+    works there; loading by path keeps it working when a caller imports this
+    module under another name.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "abk_common", Path(__file__).resolve().parent / "abk_common.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_common = _abk_common()
+write_text = _common.write_text
 
 
 def resolve_layout(common_root: Path) -> dict[str, object]:
@@ -48,7 +68,7 @@ def replace_once(path: Path, old: str, new: str, label: str) -> None:
         return
     if old not in text:
         raise SystemExit(f"{label}: expected block not found in {path}")
-    path.write_text(text.replace(old, new, 1))
+    write_text(path, text.replace(old, new, 1))
 
 
 def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
@@ -57,7 +77,7 @@ def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
         return
     if anchor not in text:
         raise SystemExit(f"{label}: anchor not found in {path}")
-    path.write_text(text.replace(anchor, anchor + snippet, 1))
+    write_text(path, text.replace(anchor, anchor + snippet, 1))
 
 
 def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -> None:
@@ -75,7 +95,7 @@ def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -
 
     for anchor in anchors:
         if anchor in text:
-            path.write_text(text.replace(anchor, anchor + snippet, 1))
+            write_text(path, text.replace(anchor, anchor + snippet, 1))
             return
 
     raise SystemExit(f"{label}: no known anchor found in {path}")
@@ -91,13 +111,13 @@ def replace_policy_header(path: Path, policy_define: str) -> None:
     if policy_define in text:
         return
     if old in text:
-        path.write_text(text.replace(old, policy_define, 1))
+        write_text(path, text.replace(old, policy_define, 1))
         return
     if current_global in text:
-        path.write_text(text.replace(current_global, policy_define, 1))
+        write_text(path, text.replace(current_global, policy_define, 1))
         return
     if current_experimental in text:
-        path.write_text(text.replace(current_experimental, policy_define, 1))
+        write_text(path, text.replace(current_experimental, policy_define, 1))
         return
     if release_prefix not in text:
         return
@@ -127,7 +147,7 @@ def upgrade_internal_h_decls(path: Path) -> None:
     if new in text:
         return
     if old in text:
-        path.write_text(text.replace(old, new, 1))
+        write_text(path, text.replace(old, new, 1))
 
 
 def patch_internal_h(path: Path) -> None:

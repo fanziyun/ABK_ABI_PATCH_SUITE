@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
+
+
+def _abk_common():
+    """Load abk_common from this script's directory.
+
+    ABK runs each child as `python3 .../scripts/abk_child.py`, so a plain import
+    works there; loading by path keeps it working when a caller imports this
+    module under another name.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "abk_common", Path(__file__).resolve().parent / "abk_common.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_common = _abk_common()
+write_text = _common.write_text
 
 
 def ensure_contains(path: Path, needle: str, label: str) -> None:
@@ -17,7 +37,7 @@ def replace_once(path: Path, old: str, new: str, label: str) -> None:
         return
     if old not in text:
         raise SystemExit(f"{label}: expected block missing in {path}")
-    path.write_text(text.replace(old, new, 1))
+    write_text(path, text.replace(old, new, 1))
 
 
 def replace_first_existing(path: Path, replacements: list[tuple[str, str]], label: str) -> None:
@@ -26,7 +46,7 @@ def replace_first_existing(path: Path, replacements: list[tuple[str, str]], labe
         if new in text:
             return
         if old in text:
-            path.write_text(text.replace(old, new, 1))
+            write_text(path, text.replace(old, new, 1))
             return
     raise SystemExit(f"{label}: expected block missing in {path}")
 
@@ -38,7 +58,7 @@ def append_once(path: Path, line: str) -> None:
     if not text.endswith("\n"):
         text += "\n"
     text += line + "\n"
-    path.write_text(text)
+    write_text(path, text)
 
 
 def main(argv: list[str]) -> int:

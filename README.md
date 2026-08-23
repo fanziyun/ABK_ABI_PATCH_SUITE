@@ -159,6 +159,17 @@ python3 -m py_compile ABK_ABI_PATCH_SUITE/scripts/*.py
 bash -n ABK_ABI_PATCH_SUITE/setup.sh ABK_ABI_PATCH_SUITE/scripts/*.sh ABK_ABI_PATCH_SUITE/tests/smoke.sh
 ```
 
+Unit tests:
+
+```bash
+python3 ABK_ABI_PATCH_SUITE/tests/feature_porting_regression_test.py
+python3 ABK_ABI_PATCH_SUITE/tests/android13_5_15_test.py
+```
+
+The first covers the android14-6.1 fixtures; the second covers the
+android13-5.15 branches, including that the shape-rewriting helpers stay
+disarmed on a 6.1 tree.
+
 Smoke:
 
 ```bash

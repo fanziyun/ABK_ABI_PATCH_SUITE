@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
 DISPLAY_RELEASE = "7.0.12"
 DISPLAY_SECURITY_PATCH = "2026-06"
+
+
+def _abk_common():
+    """Load abk_common from this script's directory.
+
+    ABK runs each child as `python3 .../scripts/abk_child.py`, so a plain import
+    works there; loading by path keeps it working when a caller imports this
+    module under another name.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "abk_common", Path(__file__).resolve().parent / "abk_common.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_common = _abk_common()
+write_text = _common.write_text
 
 
 def replace_any(path: Path, candidates: list[str], replacement: str, label: str) -> None:
@@ -15,7 +35,7 @@ def replace_any(path: Path, candidates: list[str], replacement: str, label: str)
 
     for candidate in candidates:
         if candidate in text:
-            path.write_text(text.replace(candidate, replacement, 1))
+            write_text(path, text.replace(candidate, replacement, 1))
             return
 
     raise SystemExit(f"{label}: expected block not found in {path}")
@@ -27,7 +47,7 @@ def ensure_after(path: Path, anchor: str, snippet: str, label: str) -> None:
         return
     if anchor not in text:
         raise SystemExit(f"{label}: anchor not found in {path}")
-    path.write_text(text.replace(anchor, anchor + snippet, 1))
+    write_text(path, text.replace(anchor, anchor + snippet, 1))
 
 
 def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -> None:
@@ -43,7 +63,7 @@ def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -
 
     for anchor in anchors:
         if anchor in text:
-            path.write_text(text.replace(anchor, anchor + snippet, 1))
+            write_text(path, text.replace(anchor, anchor + snippet, 1))
             return
 
     raise SystemExit(f"{label}: no known anchor found in {path}")
@@ -84,7 +104,7 @@ def patch_build_utils(path: Path) -> None:
                 f"{path}, leaving the GKI SPL date unchanged"
             )
 
-    path.write_text(text)
+    write_text(path, text)
 
 
 def patch_sys_c(path: Path) -> None:
