@@ -475,6 +475,225 @@ int get_unused_fd_flags(unsigned flags)
     )
 
 
+def make_refactored_fd_alloc_fixture(root: Path) -> None:
+    """Fixture mirroring the post-2025-08 android13-5.15-lts (SUBLEVEL 211) shape.
+
+    The Al Viro fdtable refactor backport gave alloc_fdtable() a slot-count
+    parameter, a roundup_pow_of_two() capacity and ERR_PTR()/IS_ERR() failure
+    reporting; expand_files()/alloc_fd()/get_unused_fd_flags() kept their
+    legacy text, so the helper prechecks can still land there.
+    """
+    write_files(
+        root,
+        {
+            "fs/file.c": """#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds
+
+static struct fdtable *alloc_fdtable(unsigned int slots_wanted)
+{
+\tstruct fdtable *fdt;
+\tunsigned int nr;
+\tvoid *data;
+
+\t/*
+\t * Figure out how many fds we actually want to support in this fdtable.
+\t * Allocation steps are keyed to the size of the fdarray, since it
+\t * grows far faster than any of the other dynamic data. We try to fit
+\t * the fdarray into comfortable page-tuned chunks: starting at 1024B
+\t * and growing in powers of two from there on.  Since we called only
+\t * with slots_wanted > BITS_PER_LONG (embedded instance in files->fdtab
+\t * already gives BITS_PER_LONG slots), the above boils down to
+\t * 1.  use the smallest power of two large enough to give us that many
+\t * slots.
+\t * 2.  on 32bit skip 64 and 128 - the minimal capacity we want there is
+\t * 256 slots (i.e. 1Kb fd array).
+\t * 3.  on 64bit don't skip anything, 1Kb fd array means 128 slots there
+\t * and we are never going to be asked for 64 or less.
+\t */
+\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)
+\t\tnr = 256;
+\telse
+\t\tnr = roundup_pow_of_two(slots_wanted);
+\t/*
+\t * Note that this can drive nr *below* what we had passed if sysctl_nr_open
+\t * had been set lower between the check in expand_files() and here.
+\t *
+\t * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise
+\t * bitmaps handling below becomes unpleasant, to put it mildly...
+\t */
+\tif (unlikely(nr > sysctl_nr_open)) {
+\t\tnr = round_down(sysctl_nr_open, BITS_PER_LONG);
+\t\tif (nr < slots_wanted)
+\t\t\treturn ERR_PTR(-EMFILE);
+\t}
+
+\t/*
+\t * Check if the allocation size would exceed INT_MAX. kvmalloc_array()
+\t * and kvmalloc() will warn if the allocation size is greater than
+\t * INT_MAX, as filp_cachep objects are not __GFP_NOWARN.
+\t *
+\t * This can happen when sysctl_nr_open is set to a very high value and
+\t * a process tries to use a file descriptor near that limit. For example,
+\t * if sysctl_nr_open is set to 1073741816 (0x3ffffff8) - which is what
+\t * systemd typically sets it to - then trying to use a file descriptor
+\t * close to that value will require allocating a file descriptor table
+\t * that exceeds 8GB in size.
+\t */
+\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))
+\t\treturn ERR_PTR(-EMFILE);
+
+\tfdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);
+\tif (!fdt)
+\t\tgoto out;
+\tfdt->max_fds = nr;
+\tdata = kvmalloc_array(nr, sizeof(struct file *), GFP_KERNEL_ACCOUNT);
+\tif (!data)
+\t\tgoto out_fdt;
+\tfdt->fd = data;
+
+\tdata = kvmalloc(max_t(size_t,
+\t\t\t\t 2 * nr / BITS_PER_BYTE + BITBIT_SIZE(nr), L1_CACHE_BYTES),
+\t\t\t\t GFP_KERNEL_ACCOUNT);
+\tif (!data)
+\t\tgoto out_arr;
+\tfdt->open_fds = data;
+\tdata += nr / BITS_PER_BYTE;
+\tfdt->close_on_exec = data;
+\tdata += nr / BITS_PER_BYTE;
+\tfdt->full_fds_bits = data;
+
+\treturn fdt;
+
+out_arr:
+\tkvfree(fdt->fd);
+out_fdt:
+\tkfree(fdt);
+out:
+\treturn ERR_PTR(-ENOMEM);
+}
+
+static int expand_fdtable(struct files_struct *files, unsigned int nr)
+\t__releases(files->file_lock)
+\t__acquires(files->file_lock)
+{
+\tstruct fdtable *new_fdt, *cur_fdt;
+
+\tspin_unlock(&files->file_lock);
+\tnew_fdt = alloc_fdtable(nr + 1);
+
+\t/* make sure all fd_install() have seen resize_in_progress
+\t * or have finished their rcu_read_lock_sched() section.
+\t */
+\tif (atomic_read(&files->count) > 1)
+\t\tsynchronize_rcu();
+
+\tspin_lock(&files->file_lock);
+\tif (IS_ERR(new_fdt))
+\t\treturn PTR_ERR(new_fdt);
+\tcur_fdt = files_fdtable(files);
+\tBUG_ON(nr < cur_fdt->max_fds);
+\tcopy_fdtable(new_fdt, cur_fdt);
+\trcu_assign_pointer(files->fdt, new_fdt);
+\tif (cur_fdt != &files->fdtab)
+\t\tcall_rcu(&cur_fdt->rcu, free_fdtable_rcu);
+\t/* coupled with smp_rmb() in fd_install() */
+\tsmp_wmb();
+\treturn 1;
+}
+
+static int expand_files(struct files_struct *files, unsigned int nr)
+\t__releases(files->file_lock)
+\t__acquires(files->file_lock)
+{
+\tstruct fdtable *fdt;
+\tint expanded = 0;
+
+repeat:
+\tfdt = files_fdtable(files);
+
+\t/* Do we need to expand? */
+\tif (nr < fdt->max_fds)
+\t\treturn expanded;
+
+\t/* Can we expand? */
+\tif (nr >= sysctl_nr_open)
+\t\treturn -EMFILE;
+
+\tif (unlikely(files->resize_in_progress)) {
+\t\tspin_unlock(&files->file_lock);
+\t\texpanded = 1;
+\t\twait_event(files->resize_wait, !files->resize_in_progress);
+\t\tspin_lock(&files->file_lock);
+\t\tgoto repeat;
+\t}
+
+\t/* All good, so we try */
+\tfiles->resize_in_progress = true;
+\texpanded = expand_fdtable(files, nr);
+\tfiles->resize_in_progress = false;
+
+\twake_up_all(&files->resize_wait);
+\treturn expanded;
+}
+
+static int alloc_fd(unsigned start, unsigned end, unsigned flags)
+{
+\tstruct files_struct *files = current->files;
+\tunsigned int fd;
+\tint error;
+\tstruct fdtable *fdt;
+
+\tspin_lock(&files->file_lock);
+repeat:
+\tfdt = files_fdtable(files);
+\tfd = start;
+\tif (fd < files->next_fd)
+\t\tfd = files->next_fd;
+
+\tif (fd < fdt->max_fds)
+\t\tfd = find_next_fd(fdt, fd);
+
+\t/*
+\t * N.B. For clone tasks sharing a files structure, this test
+\t * will limit the total number of files that can be opened.
+\t */
+\terror = -EMFILE;
+\tif (fd >= end)
+\t\tgoto out;
+
+\terror = expand_files(files, fd);
+\tif (error < 0)
+\t\tgoto out;
+
+\t/*
+\t * If we needed to expand the fs array we
+\t * might have blocked - try again.
+\t */
+\tif (error)
+\t\tgoto repeat;
+
+\tif (start <= files->next_fd)
+\t\tfiles->next_fd = fd + 1;
+
+\t__set_open_fd(fd, fdt);
+\tif (flags & O_CLOEXEC)
+\t\t__set_close_on_exec(fd, fdt);
+\telse
+\t\t__clear_close_on_exec(fd, fdt);
+\terror = fd;
+out:
+\tspin_unlock(&files->file_lock);
+\treturn error;
+}
+
+int get_unused_fd_flags(unsigned flags)
+{
+\treturn __get_unused_fd_flags(flags, rlimit(RLIMIT_NOFILE));
+}
+""",
+        },
+    )
+
+
 def make_slub_fixture(root: Path) -> None:
     write_files(
         root,
@@ -1135,6 +1354,29 @@ alloc_fdtable(unsigned int slots_wanted)""",
         self.assertIn("alloc_fdtable(unsigned int slots_wanted)", text)
         self.assertIn("        slots_wanted = abk_fdtable_slots_wanted(slots_wanted);", text)
         self.assertIn("if (unlikely(nr > INT_MAX / sizeof(struct file *)))", text)
+        self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
+
+        rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(rerun["mode"], "already_patched")
+
+    def test_fd_alloc_hotpath_accepts_refactored_upstream_shape(self) -> None:
+        make_refactored_fd_alloc_fixture(self.root)
+
+        result = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)
+        self.assertEqual(result["mode"], "patched")
+        self.assertIn("upstream_shape", result)
+
+        text = (self.root / "fs/file.c").read_text()
+        # The refactored capacity stays upstream: no rewrite, no spurious
+        # slots_wanted local, and no dead slot-count helper.
+        self.assertIn("nr = roundup_pow_of_two(slots_wanted);", text)
+        self.assertIn("return ERR_PTR(-EMFILE);", text)
+        self.assertNotIn("\tunsigned int slots_wanted;\n", text)
+        self.assertNotIn("abk_fdtable_slots_wanted", text)
+        # The expand_files()/alloc_fd() prechecks do land.
+        self.assertIn("abk_expand_files_needed", text)
+        self.assertIn("if (!abk_expand_files_needed(fdt, nr))", text)
+        self.assertIn("if (abk_expand_files_needed(fdt, fd)) {", text)
         self.assert_count(text, "/* ABK feature_porting: fd allocation hotpath helper graft. */")
 
         rerun = FEATURE_PORTING.patch_fd_alloc_hotpath(self.root)

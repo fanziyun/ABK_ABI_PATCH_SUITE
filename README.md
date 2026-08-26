@@ -7,7 +7,11 @@ Target families:
 - `android14-6.1` — the family the suite was written against
 - `android13-5.15` — supported as of the 5.15 support line; capabilities whose
   target types or files arrived after 5.15 degrade to report-only rather than
-  failing the build
+  failing the build. Since the Aug-2025 Al Viro fdtable refactor backport
+  (around SUBLEVEL 190 on `android13-5.15-lts`), `alloc_fdtable()` uses the
+  upstream slot-count/`ERR_PTR()` shape; `fd_alloc_hotpath` treats that shape as
+  already upstream and only lands the `expand_files()`/`alloc_fd()` helper
+  prechecks.
 
 The suite reads `ABK_BUILD_ANDROID_VERSION` / `ABK_BUILD_KERNEL_VERSION` /
 `ABK_BUILD_SUB_LEVEL`, which ABK exports at both module stages, and falls back

@@ -1216,6 +1216,36 @@ def patch_pidfd_preparation_compat(common_root: Path) -> dict[str, object]:
     }
 
 
+def _probe_refactored_alloc_fdtable(text: str, alloc_signature_pattern: str) -> bool:
+    """True when alloc_fdtable() already carries the upstream refactored shape.
+
+    The Al Viro fdtable series (backported to android13-5.15-lts in Aug 2025
+    between SUBLEVEL 189 and 190, and native in 6.12) replaced the legacy
+    capacity computation (``nr /= (1024 / sizeof(struct file *)); ...``) with a
+    slot-count parameter, a roundup_pow_of_two() capacity, and ERR_PTR()/
+    IS_ERR() failure reporting.  Distinguish it from the intermediate
+    ``nr = ALIGN(slots_wanted, BITS_PER_LONG)`` spelling that the fallback in
+    patch_fd_alloc_hotpath() already handles.
+    """
+    match = re.search(alloc_signature_pattern, text, re.MULTILINE)
+    if not match or match.group("alloc_param") != "slots_wanted":
+        return False
+    try:
+        start, end = find_c_block_regex(
+            text, alloc_signature_pattern, "feature_porting/fd_alloc_probe"
+        )
+    except SystemExit:
+        return False
+    scope = text[start:end]
+    return (
+        re.search(r"nr\s*=\s*roundup_pow_of_two\s*\(\s*slots_wanted\s*\)\s*;", scope)
+        is not None
+        and "IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256" in scope
+        and "return ERR_PTR(-EMFILE)" in scope
+        and "nr = ALIGN(slots_wanted, BITS_PER_LONG);" not in scope
+    )
+
+
 def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     file_c = common_root / "fs/file.c"
     text = read_text(file_c)
@@ -1258,7 +1288,13 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     ensure_contains(file_c, "int get_unused_fd_flags(unsigned flags)", "feature_porting/fd_alloc")
 
     helper_anchor = """#define fdt_words(fdt) ((fdt)->max_fds / BITS_PER_LONG) // words in ->open_fds\n"""
-    helper_block = """/* ABK feature_porting: fd allocation hotpath helper graft. */\nstatic inline unsigned int abk_fdtable_slots_wanted(unsigned int nr)\n{\n\tunsigned int slots_wanted;\n\n\tslots_wanted = nr + 1;\n\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)\n\t\treturn 256;\n\treturn roundup_pow_of_two(slots_wanted);\n}\n\nstatic inline bool abk_expand_files_needed(const struct fdtable *fdt, unsigned int nr)\n{\n\treturn nr >= fdt->max_fds;\n}\n"""
+    helper_slots_block = """/* ABK feature_porting: fd allocation hotpath slot-count helper. */\nstatic inline unsigned int abk_fdtable_slots_wanted(unsigned int nr)\n{\n\tunsigned int slots_wanted;\n\n\tslots_wanted = nr + 1;\n\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)\n\t\treturn 256;\n\treturn roundup_pow_of_two(slots_wanted);\n}\n"""
+    helper_expand_block = """/* ABK feature_porting: fd allocation hotpath helper graft. */\nstatic inline bool abk_expand_files_needed(const struct fdtable *fdt, unsigned int nr)\n{\n\treturn nr >= fdt->max_fds;\n}\n"""
+    # On the refactored upstream shape the slot-count helper would be a no-op
+    # (alloc_fdtable() already derives capacity from the requested slot count),
+    # so only the expand_files()/alloc_fd() helper prechecks are landed there.
+    refactored_alloc = _probe_refactored_alloc_fdtable(text, alloc_signature_pattern)
+    helper_block = helper_expand_block if refactored_alloc else helper_slots_block + helper_expand_block
     if helper_anchor in text:
         text = replace_once(text, helper_anchor, helper_anchor + "\n" + helper_block, "feature_porting/fd_alloc_helpers")
     else:
@@ -1292,49 +1328,66 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             + "\t\treturn NULL;\n"
         )
 
-        if (
-            alloc_param != "slots_wanted"
-            and "unsigned int slots_wanted;" not in alloc_scope
-            and "unsigned int slots_wanted = " not in alloc_scope
-        ):
-            brace_idx = alloc_scope.find("{")
-            if brace_idx < 0:
-                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: opening brace missing")
-            tail = alloc_scope[brace_idx + 1 :]
-            if tail.startswith("\n"):
-                tail = tail[1:]
-            alloc_scope = alloc_scope[: brace_idx + 1] + "\n\tunsigned int slots_wanted;\n" + tail
-
-        if capacity_old in alloc_scope:
-            alloc_scope = alloc_scope.replace(
-                capacity_old,
-                f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n",
-                1,
-            )
+        if refactored_alloc:
+            # The refactored shape already derives capacity from the requested
+            # slot count and reports failures through ERR_PTR()/IS_ERR().  Keep
+            # the function untouched; verify the whole refactor is present so a
+            # half-backported tree still fails loudly instead of being recorded
+            # as an upstream-shaped success.
+            if (
+                "nr = round_down(sysctl_nr_open, BITS_PER_LONG);" not in alloc_scope
+                or "INT_MAX / sizeof(struct file *)" not in alloc_scope
+            ):
+                raise SystemExit(
+                    "feature_porting/fd_alloc_alloc_fdtable: refactored shape "
+                    "incomplete (expected round_down sysctl guard and INT_MAX "
+                    "guard)"
+                )
+            alloc_scope = alloc_original_scope
         else:
-            capacity_align_match = re.search(capacity_align_pattern, alloc_scope)
-            if capacity_align_match:
-                indent = capacity_align_match.group("indent")
-                if f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" not in alloc_scope:
-                    capacity_new = (
-                        f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n"
-                        f"{indent}nr = ALIGN(slots_wanted, BITS_PER_LONG);\n"
-                    )
-                    alloc_scope = (
-                        alloc_scope[: capacity_align_match.start()]
-                        + capacity_new
-                        + alloc_scope[capacity_align_match.end() :]
-                    )
+            if (
+                alloc_param != "slots_wanted"
+                and "unsigned int slots_wanted;" not in alloc_scope
+                and "unsigned int slots_wanted = " not in alloc_scope
+            ):
+                brace_idx = alloc_scope.find("{")
+                if brace_idx < 0:
+                    raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: opening brace missing")
+                tail = alloc_scope[brace_idx + 1 :]
+                if tail.startswith("\n"):
+                    tail = tail[1:]
+                alloc_scope = alloc_scope[: brace_idx + 1] + "\n\tunsigned int slots_wanted;\n" + tail
+
+            if capacity_old in alloc_scope:
+                alloc_scope = alloc_scope.replace(
+                    capacity_old,
+                    f"\tslots_wanted = abk_fdtable_slots_wanted({alloc_param});\n\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n",
+                    1,
+                )
             else:
-                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
+                capacity_align_match = re.search(capacity_align_pattern, alloc_scope)
+                if capacity_align_match:
+                    indent = capacity_align_match.group("indent")
+                    if f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n" not in alloc_scope:
+                        capacity_new = (
+                            f"{indent}slots_wanted = abk_fdtable_slots_wanted({alloc_param});\n"
+                            f"{indent}nr = ALIGN(slots_wanted, BITS_PER_LONG);\n"
+                        )
+                        alloc_scope = (
+                            alloc_scope[: capacity_align_match.start()]
+                            + capacity_new
+                            + alloc_scope[capacity_align_match.end() :]
+                        )
+                else:
+                    raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected capacity block missing")
 
-        if "INT_MAX / sizeof(struct file *)" not in alloc_scope:
-            if sysctl_guard not in alloc_scope:
-                raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected sysctl guard missing")
-            alloc_scope = alloc_scope.replace(sysctl_guard, sysctl_guard_new, 1)
+            if "INT_MAX / sizeof(struct file *)" not in alloc_scope:
+                if sysctl_guard not in alloc_scope:
+                    raise SystemExit("feature_porting/fd_alloc_alloc_fdtable: expected sysctl guard missing")
+                alloc_scope = alloc_scope.replace(sysctl_guard, sysctl_guard_new, 1)
 
-        if alloc_scope != alloc_original_scope:
-            text = text[:alloc_start] + alloc_scope + text[alloc_end:]
+            if alloc_scope != alloc_original_scope:
+                text = text[:alloc_start] + alloc_scope + text[alloc_end:]
 
     expand_files_old = """repeat:\n\tfdt = files_fdtable(files);\n\n\t/* Do we need to expand? */\n\tif (nr < fdt->max_fds)\n\t\treturn expanded;\n\n\t/* Can we expand? */\n\tif (nr >= sysctl_nr_open)\n\t\treturn -EMFILE;\n"""
     expand_files_new = """repeat:\n\tfdt = files_fdtable(files);\n\n\t/* Do we need to expand? */\n\tif (!abk_expand_files_needed(fdt, nr))\n\t\treturn expanded;\n\n\t/* Can we expand? */\n\tif (nr >= sysctl_nr_open)\n\t\treturn -EMFILE;\n"""
@@ -1348,8 +1401,12 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
     get_unused_new = """int get_unused_fd_flags(unsigned flags)\n{\n\t/* ABK feature_porting: keep the wrapper tiny so hot open/dup callers stay on alloc_fd(). */\n\treturn __get_unused_fd_flags(flags, rlimit(RLIMIT_NOFILE));\n}\n"""
     text = replace_once(text, get_unused_old, get_unused_new, "feature_porting/fd_alloc_get_unused")
 
-    write_text(file_c, text)
-    return {
+    ported_semantics = [
+        "slot-count helper graft keeps alloc_fdtable() sizing logic out of the lock path",
+        "expand_files() now uses a helper precheck before sleeping or growing the table",
+        "alloc_fd() avoids the unconditional expand_files() call once a free descriptor was found",
+    ]
+    fd_alloc_result: dict[str, object] = {
         **graft_metadata(
             hard_port_possible=False,
             semantic_port_used=True,
@@ -1369,12 +1426,20 @@ def patch_fd_alloc_hotpath(common_root: Path) -> dict[str, object]:
             "alloc_fd()",
             "get_unused_fd_flags()",
         ],
-        "ported_semantics": [
-            "slot-count helper graft keeps alloc_fdtable() sizing logic out of the lock path",
-            "expand_files() now uses a helper precheck before sleeping or growing the table",
-            "alloc_fd() avoids the unconditional expand_files() call once a free descriptor was found",
-        ],
+        "ported_semantics": ported_semantics,
     }
+    if refactored_alloc:
+        fd_alloc_result["upstream_shape"] = (
+            "alloc_fdtable(unsigned int slots_wanted) with roundup_pow_of_two "
+            "capacity and ERR_PTR()/IS_ERR() failure reporting"
+        )
+        ported_semantics.append(
+            "upstream already grew alloc_fdtable() to the slot-count capacity "
+            "shape, so the capacity graft was not needed; expand_files() and "
+            "alloc_fd() prechecks were still landed"
+        )
+    write_text(file_c, text)
+    return fd_alloc_result
 
 
 def patch_close_range_hotpath(common_root: Path) -> dict[str, object]:
