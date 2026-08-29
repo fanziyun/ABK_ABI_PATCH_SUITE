@@ -36,15 +36,17 @@ Those paused lines remain in-tree, but they are no longer exposed through `modul
 
 ### `display_release_spoof`
 
-Stamps boot-image metadata (`os_version`/`os_patch_level` in build_utils.sh and
-the GKI SPL date) to 16.0.0 / 2026-06. It deliberately does NOT rewrite the
-kernel's runtime release interfaces (`uname()`, `/proc/sys/kernel/osrelease`,
-`/proc/version`): on android13-5.15 that made Android's vold parse the spoofed
-release as 7.0 and take the fscrypt hardware-wrapped-key path, which the 5.15
-fscrypt rejects, so `cryptfs enablefilecrypto` failed and init rebooted into
-recovery (`enablefilecrypto_failed`). f2fs-tools also reads `/proc/version`, so
-the text layer is left real too. The real UTS release suffix, vermagic and
-every other ABI-sensitive build input stay intact.
+Spoofs the visible kernel release strings (`uname()`,
+`/proc/sys/kernel/osrelease`, `/proc/version`) to `7.0.12` while preserving the
+real UTS release suffix, vermagic and every other ABI-sensitive build input, so
+module loading is unaffected. It also stamps boot-image os_version/patch_level
+and the GKI SPL date.
+
+Processes that branch on the kernel release are exempted and keep seeing the
+real value: vold parses the release to pick the fscrypt key path (a spoofed
+7.0.12 on a 5.15 kernel makes it take the HW_WRAPPED path the kernel rejects,
+so `cryptfs enablefilecrypto` fails and init reboots into recovery), and
+fsck/mkfs/resize tools gate f2fs features on `/proc/version`.
 
 Default output:
 

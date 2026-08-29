@@ -156,16 +156,27 @@ DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
-# display_release_spoof must NOT touch runtime release interfaces: vold picks
-# the fscrypt key path from the parsed kernel release, so spoofing it to 7.0.12
-# on 5.15 breaks /data decryption (reboot into recovery). f2fs-tools also reads
-# /proc/version. Only boot-image metadata is stamped.
-if grep -Fq 'abk_display_release_suffix' "$TMP_DIR/kernel/common/kernel/sys.c" \
-  || grep -Fq 'abk_display_release_suffix' "$TMP_DIR/kernel/common/fs/proc/version.c" \
-  || grep -Fq 'abk_display_release_suffix' "$TMP_DIR/kernel/common/kernel/utsname_sysctl.c"; then
-  echo "FAIL: display_release_spoof must not rewrite runtime release interfaces (uname/osrelease//proc/version)" >&2
-  exit 1
-fi
+# display_release_spoof spoofs the runtime release interfaces (uname()/osrelease/
+# /proc/version) to 7.0.12, but exempts the processes that branch on the kernel
+# release: vold picks the fscrypt key path from it (a spoofed 7.0.12 on 5.15
+# breaks /data decryption -> reboot into recovery) and fsck/mkfs/resize tools
+# gate f2fs features on /proc/version.
+grep -Fq '7.0.12%s' "$TMP_DIR/kernel/common/kernel/sys.c"
+grep -Fq 'abk_display_release_suffix(UTS_RELEASE)' "$TMP_DIR/kernel/common/kernel/sys.c"
+grep -Fq 'scnprintf(release, sizeof(release), "7.0.12%s"' "$TMP_DIR/kernel/common/fs/proc/version.c"
+grep -Fq 'abk_display_release_suffix(UTS_RELEASE)' "$TMP_DIR/kernel/common/fs/proc/version.c"
+grep -Fq 'scnprintf(tmp_data, sizeof(tmp_data), "7.0.12%s"' "$TMP_DIR/kernel/common/kernel/utsname_sysctl.c"
+grep -Fq 'abk_display_release_suffix(UTS_RELEASE)' "$TMP_DIR/kernel/common/kernel/utsname_sysctl.c"
+for f in kernel/sys.c fs/proc/version.c kernel/utsname_sysctl.c; do
+  grep -Fq 'abk_display_release_keep_real' "$TMP_DIR/kernel/common/$f" || {
+    echo "FAIL: $f must carry the keep-real exemption for vold/fsck/mkfs/resize" >&2
+    exit 1
+  }
+  grep -Fq 'strcmp(comm, "vold")' "$TMP_DIR/kernel/common/$f" || {
+    echo "FAIL: $f must exempt vold from the release spoof" >&2
+    exit 1
+  }
+done
 grep -Fq 'BOOT_IMAGE_OS_VERSION=${ABK_BOOT_IMAGE_OS_VERSION:-16.0.0}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
 grep -Fq 'BOOT_IMAGE_OS_PATCH_LEVEL=${ABK_BOOT_IMAGE_OS_PATCH_LEVEL:-2026-06}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
 grep -Fq 'MKBOOTIMG_ARGS+=("--os_version" "${BOOT_IMAGE_OS_VERSION}")' "$TMP_DIR/kernel/build/kernel/build_utils.sh"

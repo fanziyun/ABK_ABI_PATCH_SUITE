@@ -30,6 +30,7 @@ def _load(name: str, relpath: str):
 
 FEATURE_PORTING = _load("abk_feature_porting_5_15", "scripts/abk_feature_porting.py")
 BRIDGE_APPLY = _load("abk_dual_abi_bridge_apply_5_15", "scripts/abk_dual_abi_bridge_apply.py")
+DISPLAY_SPOOF = _load("abk_display_spoof_5_15", "scripts/abk_display_spoof.py")
 
 
 def write_files(root: Path, files: dict[str, str]) -> None:
@@ -142,6 +143,55 @@ class ModuleLoaderLayoutTest(unittest.TestCase):
     def test_no_loader_at_all_is_an_error(self) -> None:
         with self.assertRaises(SystemExit):
             BRIDGE_APPLY.resolve_layout(self.root)
+
+
+class DisplaySpoofAnchorTest(unittest.TestCase):
+    """The version.c include anchor differs between families."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_ensure_after_any_takes_the_first_present_anchor(self) -> None:
+        path = self.root / "version.c"
+        path.write_text('#include <linux/utsname.h>\n\nstatic int show(void)\n{\n}\n')
+        DISPLAY_SPOOF.ensure_after_any(
+            path,
+            ['#include "internal.h"\n\n', "#include <linux/utsname.h>\n\n"],
+            "/* INSERTED */\n",
+            "test",
+        )
+        text = path.read_text()
+        self.assertIn("/* INSERTED */", text)
+        self.assertLess(
+            text.index("/* INSERTED */"),
+            text.index("static int show"),
+            "insertion must land before the function it precedes",
+        )
+
+    def test_ensure_after_any_is_idempotent(self) -> None:
+        path = self.root / "version.c"
+        path.write_text("#include <linux/utsname.h>\n\nbody\n")
+        for _ in range(3):
+            DISPLAY_SPOOF.ensure_after_any(
+                path, ["#include <linux/utsname.h>\n\n"], "/* ONCE */\n", "test"
+            )
+        self.assertEqual(path.read_text().count("/* ONCE */"), 1)
+
+    def test_ensure_after_any_raises_when_no_anchor_matches(self) -> None:
+        path = self.root / "version.c"
+        path.write_text("nothing recognisable\n")
+        with self.assertRaises(SystemExit):
+            DISPLAY_SPOOF.ensure_after_any(path, ["#include <linux/fs.h>\n"], "x\n", "test")
+
+    def test_keep_real_helper_blocks_vold_and_fsck_families(self) -> None:
+        self.assertIn('strcmp(comm, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(comm, "fsck.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(comm, "mkfs.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(comm, "resize.", 7)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
 
 
 class OptionalPatchGuardTest(unittest.TestCase):
