@@ -36,7 +36,15 @@ Those paused lines remain in-tree, but they are no longer exposed through `modul
 
 ### `display_release_spoof`
 
-Spoofs visible kernel release strings to `7.0.12` while preserving ABI-sensitive build inputs and localversion suffixes. It also keeps the build-utils boot-image logging slot.
+Stamps boot-image metadata (`os_version`/`os_patch_level` in build_utils.sh and
+the GKI SPL date) to 16.0.0 / 2026-06. It deliberately does NOT rewrite the
+kernel's runtime release interfaces (`uname()`, `/proc/sys/kernel/osrelease`,
+`/proc/version`): on android13-5.15 that made Android's vold parse the spoofed
+release as 7.0 and take the fscrypt hardware-wrapped-key path, which the 5.15
+fscrypt rejects, so `cryptfs enablefilecrypto` failed and init rebooted into
+recovery (`enablefilecrypto_failed`). f2fs-tools also reads `/proc/version`, so
+the text layer is left real too. The real UTS release suffix, vermagic and
+every other ABI-sensitive build input stay intact.
 
 Default output:
 

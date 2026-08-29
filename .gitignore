@@ -10,3 +10,6 @@ tests/ko/Module.symvers
 tests/ko/modules.order
 tests/ko/.*.cmd
 tests/ko/.module-common.o
+# on-device partition dumps (large; reproduce locally instead of committing)
+tests/*.img
+tests/*.bin
