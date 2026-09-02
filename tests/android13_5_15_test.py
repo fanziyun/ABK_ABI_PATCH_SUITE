@@ -201,6 +201,13 @@ class DisplaySpoofAnchorTest(unittest.TestCase):
         self.assertNotIn(
             'strcmp(comm, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER
         )
+        # fput() lives in <linux/file.h> (not <linux/fs.h>) on android13-5.15;
+        # both patched files must get it, or the build fails with an implicit
+        # declaration error.
+        spoof_src = (REPO_ROOT / "scripts" / "abk_display_spoof.py").read_text()
+        self.assertIn(
+            "#include <linux/mm.h>\\n#include <linux/file.h>", spoof_src
+        )
 
 
 class OptionalPatchGuardTest(unittest.TestCase):

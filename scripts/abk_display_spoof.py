@@ -158,6 +158,14 @@ def patch_build_utils(path: Path) -> None:
 
 
 def patch_sys_c(path: Path) -> None:
+    # fput() is declared in <linux/file.h>; fs.h does not declare it on the
+    # 5.15 family, and only some trees pull file.h transitively.
+    ensure_after(
+        path,
+        "#include <linux/export.h>\n",
+        "#include <linux/file.h>\n",
+        "kernel/sys.c",
+    )
     candidates = [
         """/*
  * Work around broken programs that cannot handle \"Linux 3.0\".
@@ -271,7 +279,7 @@ def patch_utsname_sysctl(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/export.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/fs.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/file.h>\n",
         "kernel/utsname_sysctl.c",
     )
 
@@ -509,7 +517,7 @@ def patch_proc_version(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/fs.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/mm.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/mm.h>\n#include <linux/file.h>\n",
         "fs/proc/version.c",
     )
     ensure_after_any(
