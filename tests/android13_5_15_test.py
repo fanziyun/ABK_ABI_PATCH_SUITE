@@ -188,10 +188,19 @@ class DisplaySpoofAnchorTest(unittest.TestCase):
             DISPLAY_SPOOF.ensure_after_any(path, ["#include <linux/fs.h>\n"], "x\n", "test")
 
     def test_keep_real_helper_blocks_vold_and_fsck_families(self) -> None:
-        self.assertIn('strcmp(comm, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(comm, "fsck.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(comm, "mkfs.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(comm, "resize.", 7)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        # vold's threads are renamed to "binder:<pid>_<n>" by libbinder, so the
+        # helper must match the executable name (current->mm->exe_file) instead
+        # of current->comm; otherwise vold sees the spoofed release, takes the
+        # HW_WRAPPED fscrypt path and enablefilecrypto_failed follows.
+        self.assertIn("get_mm_exe_file(current->mm)", DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strcmp(name, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(name, "fsck.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(name, "mkfs.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn('strncmp(name, "resize.", 7)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertIn("fput(exe_file)", DISPLAY_SPOOF.KEEP_REAL_HELPER)
+        self.assertNotIn(
+            'strcmp(comm, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER
+        )
 
 
 class OptionalPatchGuardTest(unittest.TestCase):

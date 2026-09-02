@@ -88,19 +88,32 @@ KEEP_REAL_HELPER = """/*
  * vold picks the fscrypt key path from the parsed release, and fsck/mkfs/
  * resize tools gate f2fs features on /proc/version. A spoofed 7.0.12 on a
  * 5.15 kernel breaks both (enablefilecrypto_failed -> reboot to recovery).
+ *
+ * vold's threads are all renamed to "binder:<pid>_<n>" by libbinder, so
+ * current->comm never equals "vold". Match on the executable name instead
+ * (current->mm->exe_file), which is stable regardless of thread naming.
+ * get_mm_exe_file()/fput() keep the file reference safe under RCU.
  */
 static bool abk_display_release_keep_real(void)
 {
-\tconst char *comm = current->comm;
+\tconst char *name = "";
+\tstruct file *exe_file;
+\tbool keep = false;
 
-\tif (!strcmp(comm, "vold"))
-\t\treturn true;
-\tif (!strncmp(comm, "fsck.", 5) ||
-\t    !strncmp(comm, "mkfs.", 5) ||
-\t    !strncmp(comm, "resize.", 7) ||
-\t    !strncmp(comm, "e2fsck", 6))
-\t\treturn true;
-\treturn false;
+\tif (current->mm) {
+\t\texe_file = get_mm_exe_file(current->mm);
+\t\tif (exe_file) {
+\t\t\tname = exe_file->f_path.dentry->d_name.name;
+\t\t\tif (!strcmp(name, "vold") ||
+\t\t\t    !strncmp(name, "fsck.", 5) ||
+\t\t\t    !strncmp(name, "mkfs.", 5) ||
+\t\t\t    !strncmp(name, "resize.", 7) ||
+\t\t\t    !strncmp(name, "e2fsck", 6))
+\t\t\t\tkeep = true;
+\t\t\tfput(exe_file);
+\t\t}
+\t}
+\treturn keep;
 }
 
 """
@@ -258,7 +271,7 @@ def patch_utsname_sysctl(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/export.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/fs.h>\n",
         "kernel/utsname_sysctl.c",
     )
 
@@ -496,7 +509,7 @@ def patch_proc_version(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/fs.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/mm.h>\n",
         "fs/proc/version.c",
     )
     ensure_after_any(
