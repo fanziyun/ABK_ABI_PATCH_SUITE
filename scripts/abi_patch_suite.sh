@@ -646,6 +646,8 @@ abk_abi_patch_suite_apply_selected() {
     return 0
   fi
 
-  abk_log "no ABK_MODULE_CHILD_ID provided; apply default ABI Patch Suite children"
-  abk_abi_patch_suite_apply_child "display_release_spoof"
+  # No implicit default child. Silently rewriting a kernel tree because no id
+  # was supplied is how the display_release_spoof bootloop reached devices.
+  abk_log "no ABK_MODULE_CHILD_ID provided; nothing to apply"
+  abk_log "pass an explicit child id, one of: ${ABK_ABI_PATCH_SUITE_PUBLIC_CHILDREN[*]}"
 }

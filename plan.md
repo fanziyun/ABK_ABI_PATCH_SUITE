@@ -10,6 +10,7 @@
 - [x] framebuffer_bootlog 子模块（轻量 framebuffer/fbcon 起机日志基线，独立于 UEFI 路线；当前先停，实机表现为瞬间重启）
 - [x] framebuffer_bootlog 收口（处理 header v3/v4 `vendor_cmdline` 分流与 `CONFIG_CMDLINE` 内建 `console=ttynull`；当前先停，不再继续扩）
 - [ ] network_porting 后续：driver/GSO 相关网络外围收口（仅分类，继续 deferred/blocked_by_driver_scope；当前暂停，不再继续推进）
+- [x] display_release_spoof uid 分流（uid < 1000 看真值避免 netbpfload 选错 BPF 变体 + vold/f2fs 路径错误，uid >= 1000 看 7.0.12 让 Settings 显示正确；exe-name 白名单三代全失败因为 app 进程都是 zygote fork 出来的 exe_file 一律 app_process64 无法区分）
 - [x] open/close 热点路径
 - [ ] false-sharing 消除（计划外）
 - [x] close_range() 优化

@@ -156,11 +156,13 @@ DEFCONFIG="$TMP_DIR/defconfig" \
 CUSTOM_EXTERNAL_MODULE_STAGE=after_patch \
   bash "$MODULE_DIR/setup.sh" >/dev/null
 
-# display_release_spoof spoofs the runtime release interfaces (uname()/osrelease/
-# /proc/version) to 7.0.12, but exempts the processes that branch on the kernel
-# release: vold picks the fscrypt key path from it (a spoofed 7.0.12 on 5.15
-# breaks /data decryption -> reboot into recovery) and fsck/mkfs/resize tools
-# gate f2fs features on /proc/version.
+# display_release_spoof shows 7.0.12 to uid >= 1000 (Settings reads it via
+# DeviceInfoUtils.getFormattedKernelVersion() -> Os.uname().release) and keeps
+# the real release for root daemons at uid < 1000: netbpfload selects BPF program
+# variants by kernel version (a 7.0.12 on 5.15 picks the >= 6.18 progs, whose
+# bpf_set_retval does not exist here -> verifier EINVAL -> netbpfload exits 38 ->
+# reboot,bpfloader-failed), vold picks the fscrypt key path from it, and
+# f2fs-tools gate features on /proc/version.
 grep -Fq '7.0.12%s' "$TMP_DIR/kernel/common/kernel/sys.c"
 grep -Fq 'abk_display_release_suffix(UTS_RELEASE)' "$TMP_DIR/kernel/common/kernel/sys.c"
 grep -Fq 'scnprintf(release, sizeof(release), "7.0.12%s"' "$TMP_DIR/kernel/common/fs/proc/version.c"
@@ -169,13 +171,19 @@ grep -Fq 'scnprintf(tmp_data, sizeof(tmp_data), "7.0.12%s"' "$TMP_DIR/kernel/com
 grep -Fq 'abk_display_release_suffix(UTS_RELEASE)' "$TMP_DIR/kernel/common/kernel/utsname_sysctl.c"
 for f in kernel/sys.c fs/proc/version.c kernel/utsname_sysctl.c; do
   grep -Fq 'abk_display_release_keep_real' "$TMP_DIR/kernel/common/$f" || {
-    echo "FAIL: $f must carry the keep-real exemption for vold/fsck/mkfs/resize" >&2
+    echo "FAIL: $f must carry the keep-real exemption" >&2
     exit 1
   }
-  grep -Fq 'strcmp(comm, "vold")' "$TMP_DIR/kernel/common/$f" || {
-    echo "FAIL: $f must exempt vold from the release spoof" >&2
+  grep -Fq '__kuid_val(current_uid()) < 1000' "$TMP_DIR/kernel/common/$f" || {
+    echo "FAIL: $f must keep the real release for uid < 1000 (netbpfload/vold/f2fs-tools)" >&2
     exit 1
   }
+  # An exe-name allowlist cannot tell Settings from any other zygote child, so
+  # it can protect the daemons or reach Settings but never both.
+  if grep -Fq 'get_mm_exe_file' "$TMP_DIR/kernel/common/$f"; then
+    echo "FAIL: $f must not go back to exe-name matching" >&2
+    exit 1
+  fi
 done
 grep -Fq 'BOOT_IMAGE_OS_VERSION=${ABK_BOOT_IMAGE_OS_VERSION:-16.0.0}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"
 grep -Fq 'BOOT_IMAGE_OS_PATCH_LEVEL=${ABK_BOOT_IMAGE_OS_PATCH_LEVEL:-2026-06}' "$TMP_DIR/kernel/build/kernel/build_utils.sh"

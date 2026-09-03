@@ -42,11 +42,28 @@ real UTS release suffix, vermagic and every other ABI-sensitive build input, so
 module loading is unaffected. It also stamps boot-image os_version/patch_level
 and the GKI SPL date.
 
-Processes that branch on the kernel release are exempted and keep seeing the
-real value: vold parses the release to pick the fscrypt key path (a spoofed
-7.0.12 on a 5.15 kernel makes it take the HW_WRAPPED path the kernel rejects,
-so `cryptfs enablefilecrypto` fails and init reboots into recovery), and
-fsck/mkfs/resize tools gate f2fs features on `/proc/version`.
+Processes are split by **uid**, not by executable name:
+
+- **uid >= 1000 sees `7.0.12`** — Settings runs as `sharedUserId
+  android.uid.system` and reads the release through
+  `DeviceInfoUtils.getFormattedKernelVersion()` → `Os.uname().release`, so
+  "About phone → Kernel version" shows the spoof. Apps read it for display too.
+- **uid < 1000 sees the real release** — root daemons started by init branch on
+  it and must not be lied to:
+  - `netbpfload`/`bpfloader` (uid 0) derives its kver from the release. A
+    spoofed `7.0.12` on a 5.15 kernel selects the BPF program variants gated at
+    `>= 6.18`, whose helpers do not exist here — `getsockopt_prog_6_18_v` calls
+    `bpf_set_retval` (helper 187, added in 5.18) — so the verifier rejects them,
+    netbpfload exits 38 and init reboots with `reboot,bpfloader-failed`.
+  - `vold` parses the release to pick the fscrypt key path; a spoof makes it
+    take the HW_WRAPPED path the kernel rejects, so `cryptfs enablefilecrypto`
+    fails and init reboots into recovery (`enablefilecrypto_failed`).
+  - f2fs-tools (`fsck.`/`mkfs.`/`resize.f2fs`) gate features on `/proc/version`.
+
+An exe-name allowlist cannot express this split: every app process is forked
+from zygote and so has `exe_file == "app_process64"`, indistinguishable from
+Settings. That is why the earlier name-matching versions could protect the
+daemons or reach Settings, but never both.
 
 Default output:
 

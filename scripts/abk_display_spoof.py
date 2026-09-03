@@ -5,13 +5,30 @@ Spoofs the visible kernel release strings (uname(), /proc/sys/kernel/osrelease,
 /proc/version) to 7.0.12 while preserving the real UTS release suffix, vermagic
 and every other ABI-sensitive build input, so module loading is unaffected.
 
-Exemption: processes that branch on the kernel release must keep seeing the
-real value. Android's vold parses the release to pick the fscrypt key path; a
-spoofed 7.0.12 on a 5.15 kernel makes it take the HW_WRAPPED path the kernel
-rejects, so cryptfs enablefilecrypto fails and init reboots into recovery
-(enablefilecrypto_failed). f2fs-tools (fsck./mkfs./resize.f2fs) gate features
-on /proc/version the same way. Those processes see the real release; everyone
-else sees the spoof.
+Exemption by uid, not by executable name. Processes that branch on the kernel
+release must keep seeing the real value; processes that merely display it get
+the spoof. Root daemons (uid < 1000) see the real release:
+
+  - netbpfload/bpfloader (uid 0) derives its kver from the release, and a
+    7.0.12 on a 5.15 kernel selects the BPF program variants gated at >= 6.18
+    whose helpers do not exist here -- getsockopt_prog_6_18_v calls
+    bpf_set_retval (helper 187, added in 5.18), the verifier rejects it with
+    "invalid func unknown#187", netbpfload exits 38 and init reboots
+    (reboot,bpfloader-failed).
+  - vold parses the release to pick the fscrypt key path; a spoofed 7.0.12 makes
+    it take the HW_WRAPPED path the kernel rejects, so cryptfs
+    enablefilecrypto fails and init reboots into recovery
+    (enablefilecrypto_failed).
+  - f2fs-tools (fsck./mkfs./resize.f2fs) gate features on /proc/version.
+
+Everything at uid >= 1000 sees the spoof, which is what makes the display work:
+Settings runs as sharedUserId android.uid.system and reads the release through
+DeviceInfoUtils.getFormattedKernelVersion() -> Os.uname().release.
+
+An exe-name allowlist cannot express this split -- every app process is forked
+from zygote and so has exe_file == "app_process64", indistinguishable from
+Settings -- which is why the earlier name-matching versions could protect the
+daemons or reach Settings, but never both.
 """
 from __future__ import annotations
 
@@ -84,36 +101,36 @@ def ensure_after_any(path: Path, anchors: list[str], snippet: str, label: str) -
 
 
 KEEP_REAL_HELPER = """/*
- * Processes that branch on the kernel release must see the real value:
- * vold picks the fscrypt key path from the parsed release, and fsck/mkfs/
- * resize tools gate f2fs features on /proc/version. A spoofed 7.0.12 on a
- * 5.15 kernel breaks both (enablefilecrypto_failed -> reboot to recovery).
+ * Processes that branch on the kernel release must see the real value; the
+ * ones that merely display it may see the spoof.
  *
- * vold's threads are all renamed to "binder:<pid>_<n>" by libbinder, so
- * current->comm never equals "vold". Match on the executable name instead
- * (current->mm->exe_file), which is stable regardless of thread naming.
- * get_mm_exe_file()/fput() keep the file reference safe under RCU.
+ * The split is by uid, not by executable name: every app process is forked
+ * from zygote and so has exe_file == "app_process64", which an exe-name
+ * allowlist cannot tell apart from Settings. uid can.
+ *
+ *   uid <  AID_SYSTEM (1000)  real
+ *     Root daemons started by init. netbpfload/bpfloader (uid 0) derives its
+ *     kver from the release, and a 7.0.12 on a 5.15 kernel selects the BPF
+ *     program variants gated at >= 6.18 whose helpers do not exist here --
+ *     getsockopt_prog_6_18_v calls bpf_set_retval (helper 187, added in 5.18),
+ *     the verifier rejects it, netbpfload exits 38 and init reboots with
+ *     reboot,bpfloader-failed. vold picks the fscrypt key path from the parsed
+ *     release (a spoof takes the HW_WRAPPED path the kernel rejects ->
+ *     enablefilecrypto_failed) and f2fs-tools gate features on it too.
+ *
+ *   uid >= AID_SYSTEM (1000)  spoof
+ *     Settings (sharedUserId android.uid.system) reads it via
+ *     DeviceInfoUtils.getFormattedKernelVersion() -> Os.uname().release, and
+ *     apps read it for display. Kernel-version gating in the platform's bpf
+ *     stack lives in the loader at uid 0; the system_server side only opens
+ *     already-pinned maps and does not branch on the release.
+ *
+ * Kernel threads have no uid of interest and never display anything, so they
+ * fall on the real side along with everything else below AID_SYSTEM.
  */
 static bool abk_display_release_keep_real(void)
 {
-\tconst char *name = "";
-\tstruct file *exe_file;
-\tbool keep = false;
-
-\tif (current->mm) {
-\t\texe_file = get_mm_exe_file(current->mm);
-\t\tif (exe_file) {
-\t\t\tname = exe_file->f_path.dentry->d_name.name;
-\t\t\tif (!strcmp(name, "vold") ||
-\t\t\t    !strncmp(name, "fsck.", 5) ||
-\t\t\t    !strncmp(name, "mkfs.", 5) ||
-\t\t\t    !strncmp(name, "resize.", 7) ||
-\t\t\t    !strncmp(name, "e2fsck", 6))
-\t\t\t\tkeep = true;
-\t\t\tfput(exe_file);
-\t\t}
-\t}
-\treturn keep;
+\treturn __kuid_val(current_uid()) < 1000;
 }
 
 """
@@ -158,14 +175,8 @@ def patch_build_utils(path: Path) -> None:
 
 
 def patch_sys_c(path: Path) -> None:
-    # fput() is declared in <linux/file.h>; fs.h does not declare it on the
-    # 5.15 family, and only some trees pull file.h transitively.
-    ensure_after(
-        path,
-        "#include <linux/export.h>\n",
-        "#include <linux/file.h>\n",
-        "kernel/sys.c",
-    )
+    # sys.c already includes <linux/cred.h> and <linux/uidgid.h> on all three
+    # target families (5.15/6.1/6.6), so nothing to inject here.
     candidates = [
         """/*
  * Work around broken programs that cannot handle \"Linux 3.0\".
@@ -279,7 +290,7 @@ def patch_utsname_sysctl(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/export.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/file.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/kernel.h>\n#include <linux/cred.h>\n#include <linux/uidgid.h>\n",
         "kernel/utsname_sysctl.c",
     )
 
@@ -517,7 +528,7 @@ def patch_proc_version(path: Path) -> None:
     ensure_after(
         path,
         "#include <linux/fs.h>\n",
-        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/mm.h>\n#include <linux/file.h>\n",
+        "#include <generated/utsrelease.h>\n#include <linux/sched.h>\n#include <linux/cred.h>\n#include <linux/uidgid.h>\n",
         "fs/proc/version.c",
     )
     ensure_after_any(

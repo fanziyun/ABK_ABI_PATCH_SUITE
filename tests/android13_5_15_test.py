@@ -187,27 +187,41 @@ class DisplaySpoofAnchorTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             DISPLAY_SPOOF.ensure_after_any(path, ["#include <linux/fs.h>\n"], "x\n", "test")
 
-    def test_keep_real_helper_blocks_vold_and_fsck_families(self) -> None:
-        # vold's threads are renamed to "binder:<pid>_<n>" by libbinder, so the
-        # helper must match the executable name (current->mm->exe_file) instead
-        # of current->comm; otherwise vold sees the spoofed release, takes the
-        # HW_WRAPPED fscrypt path and enablefilecrypto_failed follows.
-        self.assertIn("get_mm_exe_file(current->mm)", DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strcmp(name, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(name, "fsck.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(name, "mkfs.", 5)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn('strncmp(name, "resize.", 7)', DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertIn("fput(exe_file)", DISPLAY_SPOOF.KEEP_REAL_HELPER)
-        self.assertNotIn(
-            'strcmp(comm, "vold")', DISPLAY_SPOOF.KEEP_REAL_HELPER
-        )
-        # fput() lives in <linux/file.h> (not <linux/fs.h>) on android13-5.15;
-        # both patched files must get it, or the build fails with an implicit
-        # declaration error.
-        spoof_src = (REPO_ROOT / "scripts" / "abk_display_spoof.py").read_text()
+    def test_keep_real_helper_splits_on_uid_not_exe_name(self) -> None:
+        # Root daemons (uid < 1000) must see the real release: netbpfload
+        # derives its kver from it and a 7.0.12 on 5.15 selects BPF programs
+        # gated at >= 6.18 whose bpf_set_retval (helper 187, added in 5.18) does
+        # not exist -> verifier EINVAL -> netbpfload exits 38 -> init reboots
+        # with reboot,bpfloader-failed. vold and f2fs-tools are root too, so the
+        # same rule covers the older enablefilecrypto_failed regression.
         self.assertIn(
-            "#include <linux/mm.h>\\n#include <linux/file.h>", spoof_src
+            "__kuid_val(current_uid()) < 1000", DISPLAY_SPOOF.KEEP_REAL_HELPER
         )
+        # An exe-name allowlist cannot express the split: every app process is
+        # forked from zygote and so has exe_file == "app_process64", which is
+        # indistinguishable from Settings. All three historical spellings of the
+        # name-matching approach must stay gone.
+        for gone in (
+            "get_mm_exe_file",
+            "fput(exe_file)",
+            'strcmp(name, "vold")',
+            'strcmp(comm, "vold")',
+            'strncmp(name, "fsck.", 5)',
+        ):
+            self.assertNotIn(gone, DISPLAY_SPOOF.KEEP_REAL_HELPER, gone)
+
+    def test_spoof_targets_are_still_patched(self) -> None:
+        self.assertEqual(DISPLAY_SPOOF.DISPLAY_RELEASE, "7.0.12")
+        for name in ("patch_sys_c", "patch_utsname_sysctl", "patch_proc_version"):
+            self.assertTrue(hasattr(DISPLAY_SPOOF, name), name)
+        # current_uid()/__kuid_val() come from <linux/cred.h>/<linux/uidgid.h>;
+        # the exe-name era needed <linux/mm.h>/<linux/file.h> for
+        # get_mm_exe_file()/fput() and those injections must not linger, or the
+        # patched files carry includes nothing references.
+        spoof_src = (REPO_ROOT / "scripts" / "abk_display_spoof.py").read_text()
+        self.assertIn("#include <linux/cred.h>", spoof_src)
+        self.assertIn("#include <linux/uidgid.h>", spoof_src)
+        self.assertNotIn("#include <linux/file.h>", spoof_src)
 
 
 class OptionalPatchGuardTest(unittest.TestCase):
